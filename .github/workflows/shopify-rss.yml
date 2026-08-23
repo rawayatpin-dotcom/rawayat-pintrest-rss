@@ -54,21 +54,26 @@ jobs:
               if not images:
                   continue
 
-              image_url = images[0].get("src", "")
               published = product.get("published_at") or datetime.now(timezone.utc).isoformat()
 
-              item = f"""
+              for image in images:
+                  image_url = image.get("src", "")
+
+                  if not image_url:
+                      continue
+
+                  item = f"""
           <item>
             <title>{escape(title)}</title>
             <link>{escape(product_url)}</link>
-            <guid>{escape(product_url)}</guid>
+            <guid>{escape(product_url + "?image=" + image_url)}</guid>
             <description>{escape(description)}</description>
             <pubDate>{escape(published)}</pubDate>
             <enclosure url="{escape(image_url)}" type="image/jpeg" />
           </item>
           """
 
-              rss_items.append(item)
+                  rss_items.append(item)
 
           rss = f"""<?xml version="1.0" encoding="UTF-8"?>
           <rss version="2.0">
@@ -85,7 +90,7 @@ jobs:
           with open("rss.xml", "w", encoding="utf-8") as f:
               f.write(rss)
 
-          print(f"Generated RSS feed with {len(rss_items)} products.")
+          print(f"Generated RSS feed with {len(rss_items)} images.")
           PY
 
       - name: Commit RSS feed
@@ -95,6 +100,6 @@ jobs:
 
           git add rss.xml
 
-          git diff --cached --quiet || git commit -m "Update Shopify RSS feed"
+          git diff --cached --quiet || git commit -m "Update Shopify RSS feed with all product images"
 
           git push
