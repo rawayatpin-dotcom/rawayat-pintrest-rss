@@ -16,7 +16,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Generate RSS feed
+      - name: Generate RSS and Catalog feeds
         run: |
           python3 <<'PY'
           import json
@@ -39,6 +39,7 @@ jobs:
 
           products = data.get("products", [])
           rss_items = []
+          catalog_items = []
 
           for product in products:
               title = product.get("title", "")
@@ -50,12 +51,14 @@ jobs:
               description = " ".join(description.split())
 
               images = product.get("images", [])
+              variants = product.get("variants", [])
 
               if not images:
                   continue
 
               published = product.get("published_at") or datetime.now(timezone.utc).isoformat()
 
+              # --- 1. BUILD RSS.XML ITEMS (Image-per-item for auto Pins) ---
               for image in images:
                   image_url = image.get("src", "")
 
@@ -63,18 +66,43 @@ jobs:
                       continue
 
                   item = f"""
-          <item>
-            <title>{escape(title)}</title>
-            <link>{escape(product_url)}</link>
-            <guid>{escape(product_url + "?image=" + image_url)}</guid>
-            <description>{escape(description)}</description>
-            <pubDate>{escape(published)}</pubDate>
-            <enclosure url="{escape(image_url)}" type="image/jpeg" />
-          </item>
-          """
-
+            <item>
+              <title>{escape(title)}</title>
+              <link>{escape(product_url)}</link>
+              <guid>{escape(product_url + "?image=" + image_url)}</guid>
+              <description>{escape(description)}</description>
+              <pubDate>{escape(published)}</pubDate>
+              <enclosure url="{escape(image_url)}" type="image/jpeg" />
+            </item>
+            """
                   rss_items.append(item)
 
+              # --- 2. BUILD CATALOG.XML ITEMS (One item per product for Pinterest Catalogs) ---
+              if variants:
+                  first_variant = variants[0]
+                  prod_id = str(product.get("id", ""))
+                  price = first_variant.get("price", "0")
+                  main_image = images[0].get("src", "")
+                  is_available = any(v.get("available", False) for v in variants)
+                  availability = "in stock" if is_available else "out of stock"
+                  vendor = product.get("vendor", "Rawayat")
+
+                  cat_item = f"""
+            <item>
+              <g:id>{escape(prod_id)}</g:id>
+              <g:title>{escape(title)}</g:title>
+              <g:description>{escape(description)}</g:description>
+              <g:link>{escape(product_url)}</g:link>
+              <g:image_link>{escape(main_image)}</g:image_link>
+              <g:price>{escape(price)} PKR</g:price>
+              <g:availability>{availability}</g:availability>
+              <g:condition>new</g:condition>
+              <g:brand>{escape(vendor)}</g:brand>
+            </item>
+            """
+                  catalog_items.append(cat_item)
+
+          # --- WRITE RSS.XML ---
           rss = f"""<?xml version="1.0" encoding="UTF-8"?>
           <rss version="2.0">
             <channel>
@@ -90,16 +118,31 @@ jobs:
           with open("rss.xml", "w", encoding="utf-8") as f:
               f.write(rss)
 
-          print(f"Generated RSS feed with {len(rss_items)} images.")
+          # --- WRITE CATALOG.XML ---
+          catalog = f"""<?xml version="1.0" encoding="UTF-8"?>
+          <rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">
+            <channel>
+              <title>Rawayat Luxe Catalog</title>
+              <link>{SHOPIFY_STORE}</link>
+              <description>Rawayat Luxe Pinterest Product Catalog</description>
+              {''.join(catalog_items)}
+            </channel>
+          </rss>
+          """
+
+          with open("catalog.xml", "w", encoding="utf-8") as f:
+              f.write(catalog)
+
+          print(f"Generated rss.xml with {len(rss_items)} images.")
+          print(f"Generated catalog.xml with {len(catalog_items)} products.")
           PY
 
-      - name: Commit RSS feed
+      - name: Commit RSS feed and Catalog
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          git add rss.xml
+          git add rss.xml catalog.xml
 
-          git diff --cached --quiet || git commit -m "Update Shopify RSS feed with all product images"
-
+          git diff --cached --quiet || git commit -m "Update Shopify RSS feed and Pinterest Catalog XML"
           git push
