@@ -27,6 +27,29 @@ jobs:
 
           SHOPIFY_STORE = "https://rawayatluxe.com"
 
+          # --------------------------------------------------
+          # 1. GET CURRENT PKR TO USD EXCHANGE RATE
+          # --------------------------------------------------
+          exchange_url = "https://open.er-api.com/v6/latest/PKR"
+
+          exchange_request = urllib.request.Request(
+              exchange_url,
+              headers={"User-Agent": "Rawayat-Pinterest-Catalog/1.0"}
+          )
+
+          with urllib.request.urlopen(exchange_request, timeout=30) as response:
+              exchange_data = json.load(response)
+
+          if exchange_data.get("result") != "success":
+              raise RuntimeError("Unable to retrieve PKR to USD exchange rate.")
+
+          pkr_to_usd = exchange_data["rates"]["USD"]
+
+          print(f"Current PKR to USD rate: {pkr_to_usd}")
+
+          # --------------------------------------------------
+          # 2. GET PRODUCTS FROM SHOPIFY
+          # --------------------------------------------------
           url = SHOPIFY_STORE + "/products.json?limit=250"
 
           req = urllib.request.Request(
@@ -34,10 +57,11 @@ jobs:
               headers={"User-Agent": "Rawayat-Pinterest-RSS/1.0"}
           )
 
-          with urllib.request.urlopen(req) as response:
+          with urllib.request.urlopen(req, timeout=30) as response:
               data = json.load(response)
 
           products = data.get("products", [])
+
           rss_items = []
           catalog_items = []
 
@@ -56,9 +80,15 @@ jobs:
               if not images:
                   continue
 
-              published = product.get("published_at") or datetime.now(timezone.utc).isoformat()
+              published = (
+                  product.get("published_at")
+                  or datetime.now(timezone.utc).isoformat()
+              )
 
-              # --- 1. BUILD RSS.XML ITEMS (Image-per-item for auto Pins) ---
+              # --------------------------------------------------
+              # 3. BUILD RSS.XML
+              # One RSS item per product image
+              # --------------------------------------------------
               for image in images:
                   image_url = image.get("src", "")
 
@@ -75,16 +105,38 @@ jobs:
               <enclosure url="{escape(image_url)}" type="image/jpeg" />
             </item>
             """
+
                   rss_items.append(item)
 
-              # --- 2. BUILD CATALOG.XML ITEMS (One item per product for Pinterest Catalogs) ---
+              # --------------------------------------------------
+              # 4. BUILD CATALOG.XML
+              # Convert Shopify PKR price to USD automatically
+              # --------------------------------------------------
               if variants:
                   first_variant = variants[0]
+
                   prod_id = str(product.get("id", ""))
-                  price = first_variant.get("price", "0")
+                  price_pkr = float(first_variant.get("price", "0"))
+
+                  # Automatic PKR -> USD conversion
+                  price_usd = price_pkr * pkr_to_usd
+
+                  # Pinterest price format: 00.00 USD
+                  pinterest_price = f"{price_usd:.2f} USD"
+
                   main_image = images[0].get("src", "")
-                  is_available = any(v.get("available", False) for v in variants)
-                  availability = "in stock" if is_available else "out of stock"
+
+                  is_available = any(
+                      v.get("available", False)
+                      for v in variants
+                  )
+
+                  availability = (
+                      "in stock"
+                      if is_available
+                      else "out of stock"
+                  )
+
                   vendor = product.get("vendor", "Rawayat")
 
                   cat_item = f"""
@@ -94,15 +146,18 @@ jobs:
               <g:description>{escape(description)}</g:description>
               <g:link>{escape(product_url)}</g:link>
               <g:image_link>{escape(main_image)}</g:image_link>
-              <g:price>{escape(price)} PKR</g:price>
+              <g:price>{escape(pinterest_price)}</g:price>
               <g:availability>{availability}</g:availability>
               <g:condition>new</g:condition>
               <g:brand>{escape(vendor)}</g:brand>
             </item>
             """
+
                   catalog_items.append(cat_item)
 
-          # --- WRITE RSS.XML ---
+          # --------------------------------------------------
+          # 5. WRITE RSS.XML
+          # --------------------------------------------------
           rss = f"""<?xml version="1.0" encoding="UTF-8"?>
           <rss version="2.0">
             <channel>
@@ -118,7 +173,9 @@ jobs:
           with open("rss.xml", "w", encoding="utf-8") as f:
               f.write(rss)
 
-          # --- WRITE CATALOG.XML ---
+          # --------------------------------------------------
+          # 6. WRITE CATALOG.XML
+          # --------------------------------------------------
           catalog = f"""<?xml version="1.0" encoding="UTF-8"?>
           <rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">
             <channel>
@@ -135,6 +192,8 @@ jobs:
 
           print(f"Generated rss.xml with {len(rss_items)} images.")
           print(f"Generated catalog.xml with {len(catalog_items)} products.")
+          print("Catalog prices were converted from PKR to USD.")
+
           PY
 
       - name: Commit RSS feed and Catalog
