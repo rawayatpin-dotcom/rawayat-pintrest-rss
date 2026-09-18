@@ -20,10 +20,28 @@ jobs:
         run: |
           python3 <<'PY'
           import json
-          import urllib.request
-          import html
-          from datetime import datetime, timezone
-          from xml.sax.saxutils import escape
+import urllib.request
+import html
+from datetime import datetime, timezone
+from xml.sax.saxutils import escape
+
+# Get current PKR -> USD exchange rate
+exchange_url = "https://open.er-api.com/v6/latest/PKR"
+
+exchange_request = urllib.request.Request(
+    exchange_url,
+    headers={"User-Agent": "Rawayat-Pinterest-Catalog/1.0"}
+)
+
+with urllib.request.urlopen(exchange_request, timeout=30) as response:
+    exchange_data = json.load(response)
+
+if exchange_data.get("result") != "success":
+    raise RuntimeError("Unable to retrieve PKR to USD exchange rate.")
+
+pkr_to_usd = exchange_data["rates"]["USD"]
+
+print(f"Current PKR to USD rate: {pkr_to_usd}")
 
           SHOPIFY_STORE = "https://rawayatluxe.com"
 
