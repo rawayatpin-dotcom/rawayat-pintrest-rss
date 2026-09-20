@@ -62,12 +62,20 @@ jobs:
                   return json.load(response)
 
           # ==================================================
-          # HELPER: CLEAN HTML
+          # HELPER: CLEAN HTML / TEXT
           # ==================================================
 
           def clean_text(value):
               if not value:
                   return ""
+
+              # Handle lists safely
+              if isinstance(value, list):
+                  value = " ".join(
+                      str(item) for item in value
+                  )
+
+              value = str(value)
 
               value = html.unescape(value)
 
@@ -101,7 +109,7 @@ jobs:
               if not value:
                   return ""
 
-              value = value.upper()
+              value = str(value).upper()
 
               value = re.sub(
                   r"[^A-Z0-9]+",
@@ -118,20 +126,34 @@ jobs:
           # ==================================================
 
           def determine_category(product):
-              title = (
+
+              title = clean_text(
                   product.get("title", "")
-                  or ""
               ).lower()
 
-              product_type = (
+              product_type = clean_text(
                   product.get("product_type", "")
-                  or ""
               ).lower()
 
-              tags = (
-                  product.get("tags", "")
-                  or ""
-              ).lower()
+              tags_value = product.get(
+                  "tags",
+                  ""
+              )
+
+              # Shopify data can contain tags as either
+              # text or a list. Handle both safely.
+              if isinstance(tags_value, list):
+
+                  tags = " ".join(
+                      str(tag)
+                      for tag in tags_value
+                  ).lower()
+
+              else:
+
+                  tags = str(
+                      tags_value or ""
+                  ).lower()
 
               combined = " ".join([
                   title,
@@ -141,33 +163,54 @@ jobs:
 
               category_rules = [
                   (
-                      ["bridal", "bride", "walima", "mehndi"],
+                      [
+                          "bridal",
+                          "bride",
+                          "walima",
+                          "mehndi"
+                      ],
                       "BRI"
                   ),
                   (
-                      ["formal", "formals", "evening"],
+                      [
+                          "formal",
+                          "formals",
+                          "evening"
+                      ],
                       "FOR"
                   ),
                   (
-                      ["lawn", "summer"],
+                      [
+                          "lawn",
+                          "summer"
+                      ],
                       "LAW"
                   ),
                   (
-                      ["party", "partywear"],
+                      [
+                          "party",
+                          "partywear"
+                      ],
                       "PAR"
                   ),
                   (
-                      ["casual"],
+                      [
+                          "casual"
+                      ],
                       "CAS"
                   ),
                   (
-                      ["luxury"],
+                      [
+                          "luxury"
+                      ],
                       "LUX"
                   )
               ]
 
               for keywords, code in category_rules:
+
                   for keyword in keywords:
+
                       if keyword in combined:
                           return code
 
@@ -182,6 +225,7 @@ jobs:
           # ==================================================
 
           def generate_temporary_sku(product):
+
               product_id = str(
                   product.get("id", "")
               )
@@ -203,11 +247,21 @@ jobs:
           # ==================================================
 
           def get_existing_sku(variants):
+
               for variant in variants:
+
                   sku = (
                       variant.get("sku")
                       or ""
-                  ).strip()
+                  )
+
+                  if isinstance(sku, list):
+                      sku = " ".join(
+                          str(item)
+                          for item in sku
+                      )
+
+                  sku = str(sku).strip()
 
                   if sku:
                       return sku
@@ -242,24 +296,31 @@ jobs:
               )
 
               if category == "BRI":
+
                   suffix = "Pakistani Bridal Wear"
 
               elif category == "FOR":
+
                   suffix = "Pakistani Formal Wear"
 
               elif category == "LAW":
+
                   suffix = "Pakistani Lawn Suit"
 
               elif category == "PAR":
+
                   suffix = "Pakistani Party Wear"
 
               elif category == "CAS":
+
                   suffix = "Pakistani Casual Wear"
 
               elif category == "LUX":
+
                   suffix = "Pakistani Luxury Fashion"
 
               else:
+
                   suffix = "Pakistani Fashion"
 
               title = (
@@ -268,7 +329,6 @@ jobs:
                   f"{vendor}"
               )
 
-              # Pinterest titles have a practical length limit.
               return title[:500]
 
           # ==================================================
@@ -293,36 +353,43 @@ jobs:
               )
 
               if category == "BRI":
+
                   fashion_term = (
                       "Pakistani bridal wear"
                   )
 
               elif category == "FOR":
+
                   fashion_term = (
                       "Pakistani formal wear"
                   )
 
               elif category == "LAW":
+
                   fashion_term = (
                       "Pakistani lawn fashion"
                   )
 
               elif category == "PAR":
+
                   fashion_term = (
                       "Pakistani party wear"
                   )
 
               elif category == "CAS":
+
                   fashion_term = (
                       "Pakistani casual fashion"
                   )
 
               elif category == "LUX":
+
                   fashion_term = (
                       "Pakistani luxury fashion"
                   )
 
               else:
+
                   fashion_term = (
                       "Pakistani fashion"
                   )
@@ -334,12 +401,15 @@ jobs:
               )
 
               if original_description:
+
                   description = (
                       base
                       + " "
                       + original_description
                   )
+
               else:
+
                   description = (
                       base
                       + " Explore Rawayat Luxe "
@@ -347,15 +417,12 @@ jobs:
                       + "available to customers worldwide."
                   )
 
-              # Add brand/wider audience context
               description += (
                   " Shop Rawayat Luxe online "
                   "for Pakistani fashion with "
                   "worldwide availability."
               )
 
-              # Pinterest description maximum is 10,000
-              # characters, but concise content is preferable.
               return description[:9000]
 
           # ==================================================
@@ -363,16 +430,30 @@ jobs:
           # ==================================================
 
           def is_preorder(product):
-              tags = product.get("tags", "")
+
+              tags = product.get(
+                  "tags",
+                  ""
+              )
 
               if isinstance(tags, list):
-                  tag_text = " ".join(tags).lower()
-              else:
-                  tag_text = str(tags).lower()
 
-              title = (
-                  product.get("title", "")
-                  or ""
+                  tag_text = " ".join(
+                      str(tag)
+                      for tag in tags
+                  ).lower()
+
+              else:
+
+                  tag_text = str(
+                      tags or ""
+                  ).lower()
+
+              title = clean_text(
+                  product.get(
+                      "title",
+                      ""
+                  )
               ).lower()
 
               combined = (
@@ -394,9 +475,6 @@ jobs:
 
           # ==================================================
           # GET ALL PRODUCTS
-          #
-          # Uses since_id pagination so the feed is not limited
-          # to the first 250 products.
           # ==================================================
 
           products = []
@@ -410,6 +488,7 @@ jobs:
               }
 
               if since_id:
+
                   query["since_id"] = str(
                       since_id
                   )
@@ -424,7 +503,9 @@ jobs:
                   + query_string
               )
 
-              page = fetch_json(url)
+              page = fetch_json(
+                  url
+              )
 
               page_products = page.get(
                   "products",
@@ -453,7 +534,6 @@ jobs:
 
               since_id = last_id
 
-              # Small pause to be polite to Shopify
               time.sleep(1)
 
           print(
@@ -474,23 +554,34 @@ jobs:
           for product in products:
 
               title = clean_text(
-                  product.get("title", "")
+                  product.get(
+                      "title",
+                      ""
+                  )
               )
 
               handle = (
-                  product.get("handle", "")
+                  product.get(
+                      "handle",
+                      ""
+                  )
                   or ""
               )
 
               if not handle:
+
                   print(
                       "Skipping product without handle:",
                       title
                   )
+
                   continue
 
               product_id = str(
-                  product.get("id", "")
+                  product.get(
+                      "id",
+                      ""
+                  )
               )
 
               product_url = (
@@ -500,7 +591,7 @@ jobs:
               )
 
               # ------------------------------------------------
-              # PRODUCT DESCRIPTION
+              # DESCRIPTION
               # ------------------------------------------------
 
               raw_description = product.get(
@@ -513,7 +604,7 @@ jobs:
               )
 
               # ------------------------------------------------
-              # PRODUCT IMAGES
+              # IMAGES
               # ------------------------------------------------
 
               images = product.get(
@@ -527,10 +618,12 @@ jobs:
               )
 
               if not images:
+
                   print(
                       "Skipping product without images:",
                       title
                   )
+
                   continue
 
               # ------------------------------------------------
@@ -542,9 +635,12 @@ jobs:
               )
 
               if existing_sku:
+
                   sku = existing_sku
                   sku_source = "Shopify"
+
               else:
+
                   sku = generate_temporary_sku(
                       product
                   )
@@ -559,7 +655,9 @@ jobs:
               # ------------------------------------------------
 
               published = (
-                  product.get("published_at")
+                  product.get(
+                      "published_at"
+                  )
                   or datetime.now(
                       timezone.utc
                   ).isoformat()
@@ -599,7 +697,6 @@ jobs:
                       )
                   )
 
-                  # Make GUID unique per image
                   guid = (
                       product_url
                       + "?image="
@@ -620,7 +717,9 @@ jobs:
             </item>
             """
 
-                  rss_items.append(item)
+                  rss_items.append(
+                      item
+                  )
 
               # ==================================================
               # BUILD CATALOG.XML
@@ -629,16 +728,10 @@ jobs:
               if not variants:
                   continue
 
-              # ------------------------------------------------
-              # MAIN VARIANT
-              # ------------------------------------------------
-
               first_variant = variants[0]
 
               # ------------------------------------------------
               # PRICE IN ORIGINAL SHOPIFY CURRENCY
-              #
-              # NO USD CONVERSION
               # ------------------------------------------------
 
               price_raw = (
@@ -650,17 +743,25 @@ jobs:
               )
 
               try:
+
                   price_number = float(
                       price_raw
                   )
-              except ValueError:
+
+              except (
+                  ValueError,
+                  TypeError
+              ):
+
                   price_number = 0
 
               if price_number <= 0:
+
                   print(
                       "Skipping catalog item with invalid price:",
                       title
                   )
+
                   continue
 
               pinterest_price = (
@@ -785,7 +886,10 @@ jobs:
               "w",
               encoding="utf-8"
           ) as f:
-              f.write(rss)
+
+              f.write(
+                  rss
+              )
 
           # ==================================================
           # WRITE CATALOG.XML
@@ -807,7 +911,10 @@ jobs:
               "w",
               encoding="utf-8"
           ) as f:
-              f.write(catalog)
+
+              f.write(
+                  catalog
+              )
 
           # ==================================================
           # FINAL REPORT
