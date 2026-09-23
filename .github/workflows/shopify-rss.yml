@@ -1281,7 +1281,7 @@ jobs:
 
               cat_item_parts = [
                   "<item>",
-                  f"  <g:id>{escape(sku)}</g:id>",
+                 f"  <g:id>{escape(product_id)}</g:id>",
                   f"  <g:item_group_id>{escape(product_id)}</g:item_group_id>",
                   f"  <g:title>{escape(catalog_title[:CATALOG_TITLE_MAX])}</g:title>",
                   f"  <g:description>{escape(catalog_description)}</g:description>",
