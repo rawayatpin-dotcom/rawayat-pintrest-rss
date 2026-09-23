@@ -1212,7 +1212,7 @@ jobs:
                   continue
 
               if is_preorder(product):
-                  availability = "pre-order"
+                  availability = "preorder"
               else:
                   is_available = any(
                       variant.get(
