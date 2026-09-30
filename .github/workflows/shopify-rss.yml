@@ -50,6 +50,7 @@ jobs:
                       "User-Agent": "Rawayat-Pinterest-Catalog/3.0"
                   }
               )
+
               with urllib.request.urlopen(
                   request,
                   timeout=30
@@ -713,6 +714,7 @@ jobs:
                   )
 
               term = fashion_term(category)
+
               term = re.sub(
                   r"^Pakistani women's\s+",
                   "",
@@ -839,6 +841,7 @@ jobs:
                       request,
                       timeout=15
                   ) as response:
+
                       raw_length = (
                           response.headers.get(
                               "Content-Length"
@@ -1072,33 +1075,29 @@ jobs:
                   )
               )
 
-              seen_images = set()
+              # ==========================================================
+              # RSS FEED
+              # ONLY THE FIRST / FEATURED SHOPIFY PRODUCT IMAGE IS USED.
+              # ONE RSS ITEM PER PRODUCT.
+              # ==========================================================
 
-              # One RSS item per unique product image.
-              for image_index, image in enumerate(
-                  images,
-                  start=1
-              ):
-                  image_url = (
-                      image.get(
-                          "src",
-                          ""
-                      )
+              first_image = images[0]
+
+              image_url = (
+                  first_image.get(
+                      "src",
+                      ""
                   )
+              )
 
-                  if not image_url:
-                      continue
-
-                  if image_url in seen_images:
-                      print(
-                          "Skipping duplicate image:",
-                          image_url
-                      )
-                      continue
-
-                  seen_images.add(
-                      image_url
+              if not image_url:
+                  print(
+                      "Skipping RSS item because first product image "
+                      "has no URL:",
+                      title
                   )
+              else:
+                  image_index = 1
 
                   pin_title = (
                       build_pinterest_title(
@@ -1118,7 +1117,7 @@ jobs:
                       )
                   )
 
-                  # Stable, compact GUID based on product ID + exact image URL.
+                  # Stable GUID based on product ID + FIRST image URL.
                   image_key = (
                       product_id
                       + "|"
@@ -1166,6 +1165,12 @@ jobs:
                       rss_item
                   )
 
+              # ==========================================================
+              # CATALOG FEED
+              # THIS SECTION IS LEFT AS-IS.
+              # CATALOG CONTINUES TO USE images[0].
+              # ==========================================================
+
               if not variants:
                   continue
 
@@ -1183,6 +1188,7 @@ jobs:
                   price_number = float(
                       price_raw
                   )
+
               except (
                   ValueError,
                   TypeError
@@ -1213,6 +1219,7 @@ jobs:
 
               if is_preorder(product):
                   availability = "preorder"
+
               else:
                   is_available = any(
                       variant.get(
@@ -1281,7 +1288,7 @@ jobs:
 
               cat_item_parts = [
                   "<item>",
-                 f"  <g:id>{escape(product_id)}</g:id>",
+                  f"  <g:id>{escape(product_id)}</g:id>",
                   f"  <g:item_group_id>{escape(product_id)}</g:item_group_id>",
                   f"  <g:title>{escape(catalog_title[:CATALOG_TITLE_MAX])}</g:title>",
                   f"  <g:description>{escape(catalog_description)}</g:description>",
@@ -1363,7 +1370,7 @@ jobs:
 
           print(
               f"Generated rss.xml with "
-              f"{len(rss_items)} image items."
+              f"{len(rss_items)} product items."
           )
 
           print(
@@ -1377,13 +1384,18 @@ jobs:
           )
 
           print(
+              "RSS uses ONLY the first Shopify product image "
+              "(images[0]) and creates ONE RSS item per product."
+          )
+
+          print(
               "Pinterest Pin titles are product-specific, "
-              "image-specific, and limited to 100 characters."
+              "first-image-specific, and limited to 100 characters."
           )
 
           print(
               "Pinterest Pin descriptions are product-specific, "
-              "image-specific, and kept below 800 characters."
+              "first-image-specific, and kept below 800 characters."
           )
 
           print(
@@ -1392,7 +1404,7 @@ jobs:
 
           print(
               "RSS enclosure MIME types are detected from "
-              "the image URL/CDN headers."
+              "the first image URL/CDN headers."
           )
 
           print(
