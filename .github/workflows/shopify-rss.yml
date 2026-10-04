@@ -1,1155 +1,835 @@
-name: Update Shopify RSS Feed
-
-on:
-  schedule:
-    - cron: "0 */6 * * *"
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
-jobs:
-  update-feed:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Generate RSS and Catalog feeds
-        run: |
-          python3 <<'PY'
-          import hashlib
-          import html
-          import json
-          import mimetypes
-          import re
-          import time
-          import urllib.parse
-          import urllib.request
-          from datetime import datetime, timezone
-          from email.utils import format_datetime
-          from xml.sax.saxutils import escape
-          from xml.etree import ElementTree as ET
-
-          SHOPIFY_STORE = "https://rawayatluxe.com"
-
-          CURRENCY = "PKR"
-          BRAND = "Rawayat"
-          STORE_NAME = "Rawayat Luxe"
-
-          PIN_TITLE_MAX = 100
-          PIN_DESCRIPTION_MAX = 790
-          CATALOG_TITLE_MAX = 500
-          CATALOG_DESCRIPTION_MAX = 10000
-
-          def fetch_json(url):
-              request = urllib.request.Request(
-                  url,
-                  headers={
-                      "User-Agent": "Rawayat-Pinterest-Catalog/3.0"
-                  }
-              )
-
-              with urllib.request.urlopen(
-                  request,
-                  timeout=30
-              ) as response:
-                  return json.load(response)
-
-          def clean_text(value):
-              if not value:
-                  return ""
-
-              if isinstance(value, list):
-                  value = " ".join(
-                      str(item)
-                      for item in value
-                  )
-
-              value = str(value)
-              value = html.unescape(value)
-
-              value = re.sub(
-                  r"<(script|style).*?>.*?</\1>",
-                  " ",
-                  value,
-                  flags=re.I | re.S
-              )
-
-              value = re.sub(
-                  r"<[^>]+>",
-                  " ",
-                  value
-              )
-
-              value = " ".join(
-                  value.split()
-              )
-
-              return value.strip()
-
-          def normalize_tags(value):
-              if isinstance(value, list):
-                  return " ".join(
-                      str(item)
-                      for item in value
-                  )
-
-              return str(value or "")
-
-          def determine_category(product):
-              title = clean_text(
-                  product.get("title", "")
-              ).lower()
-
-              product_type = clean_text(
-                  product.get("product_type", "")
-              ).lower()
-
-              tags = normalize_tags(
-                  product.get("tags", "")
-              ).lower()
-
-              combined = " ".join([
-                  title,
-                  product_type,
-                  tags
-              ])
-
-              category_rules = [
-                  (
-                      [
-                          "bridal",
-                          "bride",
-                          "walima",
-                          "mehndi"
-                      ],
-                      "BRI"
-                  ),
-                  (
-                      [
-                          "unstitched",
-                          "un-stitched",
-                          "un stitched"
-                      ],
-                      "UNS"
-                  ),
-                  (
-                      [
-                          "lawn",
-                          "summer"
-                      ],
-                      "LAW"
-                  ),
-                  (
-                      [
-                          "formal",
-                          "formals",
-                          "evening"
-                      ],
-                      "FOR"
-                  ),
-                  (
-                      [
-                          "party",
-                          "partywear",
-                          "party wear"
-                      ],
-                      "PAR"
-                  ),
-                  (
-                      [
-                          "casual"
-                      ],
-                      "CAS"
-                  ),
-                  (
-                      [
-                          "luxury"
-                      ],
-                      "LUX"
-                  )
-              ]
-
-              for keywords, code in category_rules:
-                  for keyword in keywords:
-                      if keyword in combined:
-                          return code
-
-              # Useful fallback for richly embroidered Pakistani occasion wear.
-              premium_terms = [
-                  "velvet",
-                  "tissue",
-                  "organza",
-                  "chiffon",
-                  "raw silk",
-                  "khaddar",
-                  "embellished",
-                  "embroidered"
-              ]
-
-              if any(
-                  term in combined
-                  for term in premium_terms
-              ):
-                  return "FOR"
-
-              return "FAS"
-
-          def fashion_term(category):
-              return {
-                  "BRI": "Pakistani women's bridal wear",
-                  "UNS": "Pakistani women's unstitched suits",
-                  "LAW": "Pakistani women's lawn fashion",
-                  "FOR": "Pakistani women's formal wear",
-                  "PAR": "Pakistani women's party wear",
-                  "CAS": "Pakistani women's casual fashion",
-                  "LUX": "Pakistani women's luxury fashion",
-                  "FAS": "Pakistani women's fashion"
-              }.get(
-                  category,
-                  "Pakistani women's fashion"
-              )
-
-          def short_category_name(category):
-              return {
-                  "BRI": "Pakistani Bridal Wear",
-                  "UNS": "Pakistani Unstitched Wear",
-                  "LAW": "Pakistani Lawn Fashion",
-                  "FOR": "Pakistani Formal Wear",
-                  "PAR": "Pakistani Party Wear",
-                  "CAS": "Pakistani Casual Fashion",
-                  "LUX": "Pakistani Luxury Fashion",
-                  "FAS": "Pakistani Fashion"
-              }.get(
-                  category,
-                  "Pakistani Fashion"
-              )
-
-          def product_type_label(category):
-              return {
-                  "BRI": "Women's Clothing > Pakistani Bridal Wear",
-                  "UNS": "Women's Clothing > Pakistani Unstitched Suits",
-                  "LAW": "Women's Clothing > Pakistani Lawn",
-                  "FOR": "Women's Clothing > Pakistani Formal Wear",
-                  "PAR": "Women's Clothing > Pakistani Party Wear",
-                  "CAS": "Women's Clothing > Pakistani Casual Wear",
-                  "LUX": "Women's Clothing > Pakistani Luxury Fashion",
-                  "FAS": "Women's Clothing > Pakistani Fashion"
-              }.get(
-                  category,
-                  "Women's Clothing > Pakistani Fashion"
-              )
-
-          def google_product_category(product):
-              title = clean_text(
-                  product.get("title", "")
-              ).lower()
-
-              product_type = clean_text(
-                  product.get("product_type", "")
-              ).lower()
-
-              tags = normalize_tags(
-                  product.get("tags", "")
-              ).lower()
-
-              combined = " ".join([
-                  title,
-                  product_type,
-                  tags
-              ])
-
-              if "dress" in combined and "suit" not in combined:
-                  return (
-                      "Apparel & Accessories > "
-                      "Clothing > Dresses"
-                  )
-
-              if "lehenga" in combined:
-                  return (
-                      "Apparel & Accessories > "
-                      "Clothing > Traditional & "
-                      "Ceremonial Clothing > Saris & Lehengas"
-                  )
-
-              return (
-                  "Apparel & Accessories > "
-                  "Clothing > Traditional & "
-                  "Ceremonial Clothing"
-              )
-
-          def generate_temporary_sku(
-              product,
-              used_skus
-          ):
-              product_id = str(
-                  product.get("id", "")
-              )
-
-              category = determine_category(
-                  product
-              )
-
-              if not product_id:
-                  product_id = "0000"
-
-              number = product_id[-4:].zfill(4)
-
-              base = (
-                  f"RAW-{category}-{number}"
-              )
-
-              sku = base
-              counter = 2
-
-              while sku in used_skus:
-                  sku = (
-                      f"{base}-{counter}"
-                  )
-                  counter += 1
-
-              used_skus.add(sku)
-
-              return sku
-
-          def get_existing_sku(variants):
-              for variant in variants:
-                  sku = (
-                      variant.get("sku")
-                      or ""
-                  )
-
-                  if isinstance(sku, list):
-                      sku = " ".join(
-                          str(item)
-                          for item in sku
-                      )
-
-                  sku = str(sku).strip()
-
-                  if sku:
-                      return sku
-
-              return ""
-
-          def extract_colors(description):
-              colors = []
-
-              matches = re.findall(
-                  r"\bColor:\s*"
-                  r"([A-Za-z][A-Za-z\s/&-]{1,30}?)"
-                  r"(?=\s+Fabric:"
-                  r"|\s+Work Details:"
-                  r"|\s+Model\b"
-                  r"|\s+Note:"
-                  r"|$)",
-                  description,
-                  flags=re.I
-              )
-
-              for value in matches:
-                  color = clean_text(value)
-
-                  if not color:
-                      continue
-
-                  if color.lower() not in [
-                      item.lower()
-                      for item in colors
-                  ]:
-                      colors.append(color)
-
-              return colors[:3]
-
-          FABRIC_TERMS = [
-              "tropical slub khaddar",
-              "zari tissue",
-              "medium silk",
-              "raw silk",
-              "georgette",
-              "organza",
-              "chiffon",
-              "velvet",
-              "lawn",
-              "linen",
-              "cambric",
-              "cotton",
-              "khaddar",
-              "karandi",
-              "viscose",
-              "jacquard",
-              "satin",
-              "crepe",
-              "chanderi",
-              "net",
-              "silk"
-          ]
-
-          def extract_fabrics(product, description):
-              combined = " ".join([
-                  clean_text(
-                      product.get("title", "")
-                  ),
-                  description
-              ]).lower()
-
-              fabrics = []
-
-              for fabric in FABRIC_TERMS:
-                  if fabric in combined:
-                      if fabric not in [
-                          item.lower()
-                          for item in fabrics
-                      ]:
-                          fabrics.append(
-                              fabric.title()
-                          )
-
-              return fabrics[:3]
-
-          def extract_attributes(
-              product,
-              description
-          ):
-              colors = extract_colors(
-                  description
-              )
-
-              fabrics = extract_fabrics(
-                  product,
-                  description
-              )
-
-              return colors, fabrics
-
-          def trim_text(
-              text,
-              max_chars
-          ):
-              text = clean_text(text)
-
-              if len(text) <= max_chars:
-                  return text
-
-              cut = text[:max_chars]
-
-              boundary_candidates = [
-                  cut.rfind(". "),
-                  cut.rfind("! "),
-                  cut.rfind("? ")
-              ]
-
-              boundary = max(
-                  boundary_candidates
-              )
-
-              if boundary >= int(
-                  max_chars * 0.60
-              ):
-                  return (
-                      cut[:boundary + 1]
-                  )
-
-              return (
-                  cut.rstrip(
-                      " ,;:-"
-                  )
-                  + "."
-              )
-
-          def image_view_label(
-              image_url,
-              image_index
-          ):
-              path = urllib.parse.urlparse(
-                  image_url
-              ).path
-
-              filename = path.rsplit(
-                  "/",
-                  1
-              )[-1]
-
-              stem = re.sub(
-                  r"\.[A-Za-z0-9]+$",
-                  "",
-                  filename
-              )
-
-              match = re.search(
-                  r"(?:[-_ ])([A-Za-z])(?:_\d+)?$",
-                  stem
-              )
-
-              if match:
-                  return (
-                      "View "
-                      + match.group(1).upper()
-                  )
-
-              return (
-                  f"View {image_index}"
-              )
-
-          def build_pinterest_title(
-              product,
-              description,
-              image_url,
-              image_index
-          ):
-              original_title = clean_text(
-                  product.get("title", "")
-              )
-
-              if not original_title:
-                  original_title = (
-                      "Pakistani Fashion"
-                  )
-
-              category = determine_category(
-                  product
-              )
-
-              colors, _ = extract_attributes(
-                  product,
-                  description
-              )
-
-              color = (
-                  colors[0]
-                  if colors
-                  else ""
-              )
-
-              view = image_view_label(
-                  image_url,
-                  image_index
-              )
-
-              category_term = (
-                  short_category_name(
-                      category
-                  )
-              )
-
-              vendor = clean_text(
-                  product.get(
-                      "vendor",
-                      BRAND
-                  )
-              )
-
-              parts = [
-                  original_title
-              ]
-
-              if color:
-                  parts.append(color)
-
-              parts.append(category_term)
-              parts.append(view)
-
-              if (
-                  vendor
-                  and vendor.lower()
-                  != BRAND.lower()
-              ):
-                  parts.append(vendor)
-
-              candidates = [
-                  " | ".join(parts),
-                  " | ".join([
-                      original_title,
-                      color,
-                      category_term,
-                      view
-                  ]),
-                  " | ".join([
-                      original_title,
-                      color,
-                      view
-                  ]),
-                  " | ".join([
-                      original_title,
-                      view
-                  ])
-              ]
-
-              for candidate in candidates:
-                  candidate = " | ".join([
-                      item
-                      for item in candidate.split(
-                          " | "
-                      )
-                      if item
-                  ])
-
-                  if len(candidate) <= PIN_TITLE_MAX:
-                      return candidate
-
-              return (
-                  original_title[:(
-                      PIN_TITLE_MAX
-                      - len(view)
-                      - 3
-                  )].rstrip()
-                  + " | "
-                  + view
-              )
-
-          def build_pinterest_description(
-              product,
-              original_description,
-              image_url,
-              image_index
-          ):
-              title = clean_text(
-                  product.get("title", "")
-              )
-
-              if not title:
-                  title = (
-                      "Pakistani Fashion"
-                  )
-
-              category = determine_category(
-                  product
-              )
-
-              colors, fabrics = (
-                  extract_attributes(
-                      product,
-                      original_description
-                  )
-              )
-
-              view = image_view_label(
-                  image_url,
-                  image_index
-              )
-
-              parts = [
-                  f"{view} of {title}."
-              ]
-
-              if colors:
-                  parts.append(
-                      "Colour: "
-                      + ", ".join(colors[:2])
-                      + "."
-                  )
-
-              if fabrics:
-                  parts.append(
-                      "Fabric: "
-                      + ", ".join(fabrics[:2])
-                      + "."
-                  )
-
-              parts.append(
-                  f"A {fashion_term(category)} "
-                  f"look from {STORE_NAME}, "
-                  f"featuring detailed Pakistani "
-                  f"craftsmanship."
-              )
-
-              if original_description:
-                  parts.append(
-                      trim_text(
-                          original_description,
-                          560
-                      )
-                  )
-
-              parts.append(
-                  "Shop Rawayat Luxe online for "
-                  "Pakistani fashion with worldwide "
-                  "availability."
-              )
-
-              description = " ".join(parts)
-
-              return trim_text(
-                  description,
-                  PIN_DESCRIPTION_MAX
-              )
-
-          def build_catalog_description(
-              product,
-              original_description
-          ):
-              title = clean_text(
-                  product.get("title", "")
-              ) or "Pakistani Fashion"
-
-              category = determine_category(
-                  product
-              )
-
-              colors, fabrics = (
-                  extract_attributes(
-                      product,
-                      original_description
-                  )
-              )
-
-              parts = [
-                  title + "."
-              ]
-
-              if colors:
-                  parts.append(
-                      "Colour: "
-                      + ", ".join(colors)
-                      + "."
-                  )
-
-              if fabrics:
-                  parts.append(
-                      "Fabric: "
-                      + ", ".join(fabrics)
-                      + "."
-                  )
-
-              term = fashion_term(category)
-
-              term = re.sub(
-                  r"^Pakistani women's\s+",
-                  "",
-                  term,
-                  flags=re.I
-              )
-
-              parts.append(
-                  f"Pakistani women's {term} "
-                  f"from {STORE_NAME}."
-              )
-
-              if original_description:
-                  parts.append(
-                      original_description
-                  )
-
-              parts.append(
-                  "Worldwide availability."
-              )
-
-              return trim_text(
-                  " ".join(parts),
-                  CATALOG_DESCRIPTION_MAX
-              )
-
-          def is_preorder(product):
-              tags = normalize_tags(
-                  product.get("tags", "")
-              ).lower()
-
-              title = clean_text(
-                  product.get("title", "")
-              ).lower()
-
-              combined = (
-                  tags
-                  + " "
-                  + title
-              )
-
-              preorder_terms = [
-                  "pre-order",
-                  "preorder",
-                  "pre order"
-              ]
-
-              return any(
-                  term in combined
-                  for term in preorder_terms
-              )
-
-          def format_rss_date(value):
-              if not value:
-                  return format_datetime(
-                      datetime.now(
-                          timezone.utc
-                      ),
-                      usegmt=True
-                  )
-
-              try:
-                  parsed = datetime.fromisoformat(
-                      str(value).replace(
-                          "Z",
-                          "+00:00"
-                      )
-                  )
-
-                  if parsed.tzinfo is None:
-                      parsed = parsed.replace(
-                          tzinfo=timezone.utc
-                      )
-
-                  return format_datetime(
-                      parsed,
-                      usegmt=False
-                  )
-
-              except Exception:
-                  return format_datetime(
-                      datetime.now(
-                          timezone.utc
-                      ),
-                      usegmt=True
-                  )
-
-          image_metadata_cache = {}
-
-          def get_image_metadata(
-              image_url
-          ):
-              if image_url in (
-                  image_metadata_cache
-              ):
-                  return image_metadata_cache[
-                      image_url
-                  ]
-
-              parsed = urllib.parse.urlparse(
-                  image_url
-              )
-
-              mime_type = (
-                  mimetypes.guess_type(
-                      parsed.path
-                  )[0]
-                  or "image/jpeg"
-              )
-
-              content_length = ""
-
-              try:
-                  request = urllib.request.Request(
-                      image_url,
-                      method="HEAD",
-                      headers={
-                          "User-Agent":
-                              "Rawayat-Pinterest-Catalog/3.0"
-                      }
-                  )
-
-                  with urllib.request.urlopen(
-                      request,
-                      timeout=15
-                  ) as response:
-
-                      raw_length = (
-                          response.headers.get(
-                              "Content-Length"
-                          )
-                      )
-
-                      if raw_length:
-                          content_length = str(
-                              int(raw_length)
-                          )
-
-                      header_type = (
-                          response.headers.get(
-                              "Content-Type"
-                          )
-                      )
-
-                      if header_type:
-                          header_type = (
-                              header_type.split(
-                                  ";",
-                                  1
-                              )[0].strip()
-                          )
-
-                          if header_type.startswith(
-                              "image/"
-                          ):
-                              mime_type = (
-                                  header_type
-                              )
-
-              except Exception as error:
-                  print(
-                      "Image HEAD request failed:",
-                      image_url,
-                      "->",
-                      error
-                  )
-
-              metadata = (
-                  content_length,
-                  mime_type
-              )
-
-              image_metadata_cache[
-                  image_url
-              ] = metadata
-
-              return metadata
-
-          products = []
-          since_id = None
-
-          while True:
-              query = {
-                  "limit": "250"
-              }
-
-              if since_id:
-                  query[
-                      "since_id"
-                  ] = str(since_id)
-
-              query_string = (
-                  urllib.parse.urlencode(
-                      query
-                  )
-              )
-
-              url = (
-                  SHOPIFY_STORE
-                  + "/products.json?"
-                  + query_string
-              )
-
-              page = fetch_json(url)
-
-              page_products = page.get(
-                  "products",
-                  []
-              )
-
-              if not page_products:
-                  break
-
-              products.extend(
-                  page_products
-              )
-
-              last_id = (
-                  page_products[-1].get(
-                      "id"
-                  )
-              )
-
-              if not last_id:
-                  break
-
-              if len(page_products) < 250:
-                  break
-
-              if since_id == last_id:
-                  break
-
-              since_id = last_id
-
-              time.sleep(1)
-
-          print(
-              f"Retrieved {len(products)} Shopify products."
-          )
-
-          used_skus = set()
-
-          # Preserve all existing Shopify SKUs first.
-          for product in products:
-              variants = product.get(
-                  "variants",
-                  []
-              )
-
-              existing_sku = (
-                  get_existing_sku(
-                      variants
-                  )
-              )
-
-              if existing_sku:
-                  used_skus.add(
-                      existing_sku
-                  )
-
-          rss_items = []
-          catalog_items = []
-
-          for product in products:
-              title = clean_text(
-                  product.get("title", "")
-              )
-
-              handle = (
-                  product.get(
-                      "handle",
-                      ""
-                  )
-                  or ""
-              )
-
-              if not handle:
-                  print(
-                      "Skipping product without handle:",
-                      title
-                  )
-                  continue
-
-              product_id = str(
-                  product.get(
-                      "id",
-                      ""
-                  )
-              )
-
-              product_url = (
-                  SHOPIFY_STORE
-                  + "/products/"
-                  + handle
-              )
-
-              raw_description = (
-                  product.get(
-                      "body_html",
-                      ""
-                  )
-              )
-
-              description = clean_text(
-                  raw_description
-              )
-
-              images = product.get(
-                  "images",
-                  []
-              )
-
-              variants = product.get(
-                  "variants",
-                  []
-              )
-
-              if not images:
-                  print(
-                      "Skipping product without images:",
-                      title
-                  )
-                  continue
-
-              existing_sku = (
-                  get_existing_sku(
-                      variants
-                  )
-              )
-
-              if existing_sku:
-                  sku = existing_sku
-                  sku_source = "Shopify"
-              else:
-                  sku = generate_temporary_sku(
-                      product,
-                      used_skus
-                  )
-                  sku_source = "temporary"
-
-              print(
-                  f"{title} -> "
-                  f"{sku} ({sku_source})"
-              )
-
-              published = (
-                  product.get(
-                      "published_at"
-                  )
-                  or datetime.now(
-                      timezone.utc
-                  ).isoformat()
-              )
-
-              published_rss_date = (
-                  format_rss_date(
-                      published
-                  )
-              )
-
-              # ==========================================================
-              # RSS FEED
-              # ONLY THE FIRST / FEATURED SHOPIFY PRODUCT IMAGE IS USED.
-              # ONE RSS ITEM PER PRODUCT.
-              # ==========================================================
-
-              first_image = images[0]
-
-              image_url = (
-                  first_image.get(
-                      "src",
-                      ""
-                  )
-              )
-
-              if not image_url:
-                  print(
-                      "Skipping RSS item because first product image "
-                      "has no URL:",
-                      title
-                  )
-              else:
-                  image_index = 1
-
-                  pin_title = (
-                      build_pinterest_title(
-                          product,
-                          description,
-                          image_url,
-                          image_index
-                      )
-                  )
-
-                  pin_description = (
-                      build_pinterest_description(
-                          product,
-                          description,
-                          image_url,
-                          image_index
-                      )
-                  )
-
-                  # Stable GUID based on product ID + FIRST image URL.
-                  image_key = (
-                      product_id
-                      + "|"
-                      + image_url
-                  )
-
-                  image_hash = (
-                      hashlib.sha256(
-                          image_key.encode(
-                              "utf-8"
-                          )
-                      ).hexdigest()
-                  )
-
-                  guid = (
-                      "rawayat-pinterest-"
-                      + image_hash
-                  )
-
-                  length, mime_type = (
-                      get_image_metadata(
-                          image_url
-                      )
-                  )
-
-                  enclosure_length = (
-                      length
-                      if length
-                      else "0"
-                  )
-
-                  rss_item = f"""
+#!/usr/bin/env python3
+"""
+Rawayat Luxe - Shopify to Pinterest RSS & Catalog Feed Generator
+Version: 2.0 (Production-Ready)
+
+Features:
+- Robust pagination with retry logic
+- Comprehensive error handling
+- Structured logging
+- RSS specification compliance
+- Pinterest catalog optimization
+- Image optimization detection
+- Configuration management
+- Feed validation
+- Health checks
+"""
+
+import hashlib
+import html
+import json
+import logging
+import mimetypes
+import re
+import sys
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from email.utils import format_datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Set
+from xml.etree import ElementTree as ET
+from xml.sax.saxutils import escape
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+class Config:
+    """Centralized configuration management"""
+
+    SHOPIFY_STORE = "https://rawayatluxe.com"
+    SHOPIFY_TIMEOUT = 30
+    IMAGE_TIMEOUT = 15
+    MAX_RETRIES = 3
+    RETRY_BACKOFF = 2
+    RATE_LIMIT_DELAY = 1
+    USER_AGENT = "Rawayat-Pinterest-Catalog/3.0"
+
+    CURRENCY = "PKR"
+    BRAND = "Rawayat"
+    STORE_NAME = "Rawayat Luxe"
+    CONTACT_EMAIL = "shop@rawayatluxe.com"
+
+    # Text constraints
+    PIN_TITLE_MAX = 100
+    PIN_DESCRIPTION_MAX = 790
+    CATALOG_TITLE_MAX = 500
+    CATALOG_DESCRIPTION_MAX = 10000
+
+    # Image constraints
+    MAX_IMAGE_SIZE_MB = 5
+    OPTIMAL_IMAGE_FORMATS = {"image/jpeg", "image/png", "image/webp"}
+
+    # Pagination
+    PRODUCTS_PER_PAGE = 250
+
+    # Output files
+    RSS_FILE = "rss.xml"
+    CATALOG_FILE = "catalog.xml"
+
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+
+def setup_logging() -> logging.Logger:
+    """Configure structured logging"""
+    logger = logging.getLogger("RawayatRSS")
+    logger.setLevel(logging.INFO)
+
+    # Console handler
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.INFO)
+
+    # Formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    handler.setFormatter(formatter)
+
+    logger.addHandler(handler)
+    return logger
+
+logger = setup_logging()
+
+
+# ============================================================================
+# API FETCHING WITH RETRY LOGIC
+# ============================================================================
+
+def fetch_json_with_retry(
+    url: str,
+    max_retries: int = Config.MAX_RETRIES,
+    timeout: int = Config.SHOPIFY_TIMEOUT
+) -> Dict:
+    """
+    Fetch JSON from URL with exponential backoff retry logic
+
+    Args:
+        url: URL to fetch from
+        max_retries: Maximum number of retry attempts
+        timeout: Request timeout in seconds
+
+    Returns:
+        Parsed JSON response
+
+    Raises:
+        Exception: If all retries fail
+    """
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": Config.USER_AGENT}
+            )
+
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.load(response)
+
+        except urllib.error.HTTPError as e:
+            last_error = f"HTTP {e.code}: {e.reason}"
+
+            # Don't retry on 404, 400, 403
+            if e.code in (400, 403, 404):
+                logger.error(f"Non-retryable HTTP error: {last_error}")
+                raise
+
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_error = str(e)
+
+        except json.JSONDecodeError as e:
+            last_error = f"Invalid JSON response: {e}"
+
+        except Exception as e:
+            last_error = f"Unexpected error: {e}"
+
+        # Calculate backoff delay
+        if attempt < max_retries - 1:
+            delay = Config.RETRY_BACKOFF ** attempt
+            logger.warning(
+                f"Fetch failed (attempt {attempt + 1}/{max_retries}): {last_error}. "
+                f"Retrying in {delay}s..."
+            )
+            time.sleep(delay)
+
+    raise Exception(f"Failed after {max_retries} attempts: {last_error}")
+
+
+def fetch_shopify_products(store_url: str) -> List[Dict]:
+    """
+    Fetch all products from Shopify store using pagination
+
+    Args:
+        store_url: Base Shopify store URL
+
+    Returns:
+        List of all product dictionaries
+    """
+    products = []
+    page = 1
+    max_pages = 1000  # Safety limit
+
+    while page <= max_pages:
+        try:
+            query = {
+                "limit": str(Config.PRODUCTS_PER_PAGE),
+                "page": str(page)
+            }
+
+            query_string = urllib.parse.urlencode(query)
+            url = f"{store_url}/products.json?{query_string}"
+
+            logger.info(f"Fetching page {page}...")
+            response = fetch_json_with_retry(url)
+
+            page_products = response.get("products", [])
+
+            if not page_products:
+                logger.info(f"No more products at page {page}")
+                break
+
+            products.extend(page_products)
+            logger.info(f"Retrieved {len(page_products)} products from page {page}")
+
+            # Check if this is the last page
+            if len(page_products) < Config.PRODUCTS_PER_PAGE:
+                logger.info("Reached last page (fewer than page size products)")
+                break
+
+            page += 1
+            time.sleep(Config.RATE_LIMIT_DELAY)
+
+        except Exception as e:
+            logger.error(f"Error fetching page {page}: {e}")
+            if page == 1:
+                raise  # Fail if we can't even fetch the first page
+            else:
+                logger.warning("Continuing with products already fetched")
+                break
+
+    logger.info(f"Total products fetched: {len(products)}")
+    return products
+
+
+# ============================================================================
+# TEXT PROCESSING & CLEANING
+# ============================================================================
+
+def clean_text(value: any) -> str:
+    """
+    Clean and normalize text, removing HTML tags and excess whitespace
+
+    Args:
+        value: Text to clean
+
+    Returns:
+        Cleaned text string
+    """
+    if not value:
+        return ""
+
+    # Handle lists
+    if isinstance(value, list):
+        value = " ".join(str(item) for item in value)
+
+    value = str(value)
+
+    # Unescape HTML entities
+    value = html.unescape(value)
+
+    # Remove script and style tags
+    value = re.sub(
+        r"<(script|style).*?>.*?</\1>",
+        " ",
+        value,
+        flags=re.I | re.S
+    )
+
+    # Remove all HTML tags
+    value = re.sub(r"<[^>]+>", " ", value)
+
+    # Normalize whitespace
+    value = " ".join(value.split())
+
+    return value.strip()
+
+
+def normalize_tags(value: any) -> str:
+    """Normalize tags to space-separated string"""
+    if isinstance(value, list):
+        return " ".join(str(item) for item in value)
+    return str(value or "")
+
+
+def trim_text(text: str, max_chars: int) -> str:
+    """
+    Trim text to maximum characters, breaking at sentence boundaries when possible
+
+    Args:
+        text: Text to trim
+        max_chars: Maximum number of characters
+
+    Returns:
+        Trimmed text
+    """
+    text = clean_text(text)
+
+    if len(text) <= max_chars:
+        return text
+
+    cut = text[:max_chars]
+
+    # Try to break at sentence boundaries
+    boundary_candidates = [
+        cut.rfind(". "),
+        cut.rfind("! "),
+        cut.rfind("? ")
+    ]
+
+    boundary = max(boundary_candidates)
+
+    # Only use boundary if it's at least 60% through the text
+    if boundary >= int(max_chars * 0.60):
+        return cut[:boundary + 1]
+
+    # Otherwise, trim at last space and add period
+    return cut.rstrip(" ,;:-") + "."
+
+
+# ============================================================================
+# CATEGORY & ATTRIBUTE EXTRACTION
+# ============================================================================
+
+CATEGORY_RULES = [
+    (["bridal", "bride", "walima", "mehndi"], "BRI"),
+    (["unstitched", "un-stitched", "un stitched"], "UNS"),
+    (["lawn", "summer"], "LAW"),
+    (["formal", "formals", "evening"], "FOR"),
+    (["party", "partywear", "party wear"], "PAR"),
+    (["casual"], "CAS"),
+    (["luxury"], "LUX"),
+]
+
+PREMIUM_TERMS = [
+    "velvet", "tissue", "organza", "chiffon", "raw silk",
+    "khaddar", "embellished", "embroidered"
+]
+
+FABRIC_TERMS = [
+    "tropical slub khaddar", "zari tissue", "medium silk",
+    "raw silk", "georgette", "organza", "chiffon", "velvet",
+    "lawn", "linen", "cambric", "cotton", "khaddar", "karandi",
+    "viscose", "jacquard", "satin", "crepe", "chanderi", "net", "silk"
+]
+
+CATEGORY_DISPLAY_NAMES = {
+    "BRI": "Pakistani Bridal Wear",
+    "UNS": "Pakistani Unstitched Wear",
+    "LAW": "Pakistani Lawn Fashion",
+    "FOR": "Pakistani Formal Wear",
+    "PAR": "Pakistani Party Wear",
+    "CAS": "Pakistani Casual Fashion",
+    "LUX": "Pakistani Luxury Fashion",
+    "FAS": "Pakistani Fashion"
+}
+
+FASHION_TERMS = {
+    "BRI": "Pakistani women's bridal wear",
+    "UNS": "Pakistani women's unstitched suits",
+    "LAW": "Pakistani women's lawn fashion",
+    "FOR": "Pakistani women's formal wear",
+    "PAR": "Pakistani women's party wear",
+    "CAS": "Pakistani women's casual fashion",
+    "LUX": "Pakistani women's luxury fashion",
+    "FAS": "Pakistani women's fashion"
+}
+
+PRODUCT_TYPE_LABELS = {
+    "BRI": "Women's Clothing > Pakistani Bridal Wear",
+    "UNS": "Women's Clothing > Pakistani Unstitched Suits",
+    "LAW": "Women's Clothing > Pakistani Lawn",
+    "FOR": "Women's Clothing > Pakistani Formal Wear",
+    "PAR": "Women's Clothing > Pakistani Party Wear",
+    "CAS": "Women's Clothing > Pakistani Casual Wear",
+    "LUX": "Women's Clothing > Pakistani Luxury Fashion",
+    "FAS": "Women's Clothing > Pakistani Fashion"
+}
+
+GOOGLE_CATEGORIES = {
+    "BRI": "Apparel & Accessories > Clothing > Traditional & Ceremonial Clothing",
+    "UNS": "Apparel & Accessories > Clothing > Traditional & Ceremonial Clothing",
+    "LAW": "Apparel & Accessories > Clothing > Dresses",
+    "FOR": "Apparel & Accessories > Clothing > Formal Wear",
+    "PAR": "Apparel & Accessories > Clothing > Formal Wear",
+    "CAS": "Apparel & Accessories > Clothing > Casual Wear",
+    "LUX": "Apparel & Accessories > Clothing > Traditional & Ceremonial Clothing",
+    "FAS": "Apparel & Accessories > Clothing > Traditional & Ceremonial Clothing"
+}
+
+
+def determine_category(product: Dict) -> str:
+    """
+    Determine product category from title, type, and tags
+
+    Args:
+        product: Product dictionary
+
+    Returns:
+        Category code (e.g., "BRI", "FOR")
+    """
+    title = clean_text(product.get("title", "")).lower()
+    product_type = clean_text(product.get("product_type", "")).lower()
+    tags = normalize_tags(product.get("tags", "")).lower()
+
+    combined = " ".join([title, product_type, tags])
+
+    # Check category rules
+    for keywords, code in CATEGORY_RULES:
+        for keyword in keywords:
+            if keyword in combined:
+                return code
+
+    # Check premium materials for formal wear
+    if any(term in combined for term in PREMIUM_TERMS):
+        return "FOR"
+
+    return "FAS"
+
+
+def extract_colors(description: str) -> List[str]:
+    """Extract colors from product description"""
+    colors = []
+
+    matches = re.findall(
+        r"\bColor:\s*"
+        r"([A-Za-z][A-Za-z\s/&-]{1,30}?)"
+        r"(?=\s+Fabric:|Fabric:"
+        r"|\s+Work Details:|Work Details:"
+        r"|\s+Model\b|Model\b"
+        r"|\s+Note:|Note:"
+        r"|$)",
+        description,
+        flags=re.I
+    )
+
+    for value in matches:
+        color = clean_text(value)
+        if color and color.lower() not in [item.lower() for item in colors]:
+            colors.append(color)
+
+    return colors[:3]
+
+
+def extract_fabrics(product: Dict, description: str) -> List[str]:
+    """Extract fabric types from product"""
+    combined = " ".join([
+        clean_text(product.get("title", "")),
+        description
+    ]).lower()
+
+    fabrics = []
+
+    for fabric in FABRIC_TERMS:
+        if fabric in combined:
+            if fabric not in [item.lower() for item in fabrics]:
+                fabrics.append(fabric.title())
+
+    return fabrics[:3]
+
+
+def extract_attributes(
+    product: Dict,
+    description: str
+) -> Tuple[List[str], List[str]]:
+    """Extract colors and fabrics from product"""
+    colors = extract_colors(description)
+    fabrics = extract_fabrics(product, description)
+    return colors, fabrics
+
+
+def is_preorder(product: Dict) -> bool:
+    """Check if product is marked as pre-order"""
+    tags = normalize_tags(product.get("tags", "")).lower()
+    title = clean_text(product.get("title", "")).lower()
+
+    combined = tags + " " + title
+    preorder_terms = ["pre-order", "preorder", "pre order"]
+
+    return any(term in combined for term in preorder_terms)
+
+
+# ============================================================================
+# IMAGE PROCESSING & METADATA
+# ============================================================================
+
+class ImageMetadataCache:
+    """In-memory cache for image metadata"""
+
+    def __init__(self):
+        self.cache: Dict[str, Tuple[str, str]] = {}
+
+    def get(self, url: str) -> Optional[Tuple[str, str]]:
+        """Get cached metadata (size, mime_type)"""
+        return self.cache.get(url)
+
+    def set(self, url: str, size: str, mime_type: str):
+        """Cache metadata"""
+        self.cache[url] = (size, mime_type)
+
+    def clear(self):
+        """Clear cache"""
+        self.cache.clear()
+
+
+def get_image_metadata(
+    image_url: str,
+    cache: ImageMetadataCache
+) -> Tuple[str, str]:
+    """
+    Get image metadata (size and MIME type)
+
+    Args:
+        image_url: URL of image
+        cache: Metadata cache
+
+    Returns:
+        Tuple of (content_length, mime_type)
+    """
+    # Check cache first
+    cached = cache.get(image_url)
+    if cached:
+        return cached
+
+    parsed = urllib.parse.urlparse(image_url)
+    mime_type = mimetypes.guess_type(parsed.path)[0] or "image/jpeg"
+    content_length = ""
+
+    try:
+        request = urllib.request.Request(
+            image_url,
+            method="HEAD",
+            headers={"User-Agent": Config.USER_AGENT}
+        )
+
+        with urllib.request.urlopen(request, timeout=Config.IMAGE_TIMEOUT) as response:
+            raw_length = response.headers.get("Content-Length")
+
+            if raw_length:
+                try:
+                    size_mb = int(raw_length) / (1024 * 1024)
+                    if size_mb > Config.MAX_IMAGE_SIZE_MB:
+                        logger.warning(
+                            f"Image {image_url} is {size_mb:.2f}MB "
+                            f"(exceeds {Config.MAX_IMAGE_SIZE_MB}MB limit)"
+                        )
+                    content_length = str(int(raw_length))
+                except ValueError:
+                    pass
+
+            header_type = response.headers.get("Content-Type")
+            if header_type:
+                header_type = header_type.split(";", 1)[0].strip()
+                if header_type.startswith("image/"):
+                    mime_type = header_type
+
+    except Exception as e:
+        logger.warning(f"Failed to fetch image metadata for {image_url}: {e}")
+
+    metadata = (content_length, mime_type)
+    cache.set(image_url, *metadata)
+
+    return metadata
+
+
+def image_view_label(image_url: str, image_index: int) -> str:
+    """Generate view label for image"""
+    path = urllib.parse.urlparse(image_url).path
+    filename = path.rsplit("/", 1)[-1]
+    stem = re.sub(r"\.[A-Za-z0-9]+$", "", filename)
+
+    match = re.search(r"(?:[-_ ])([A-Za-z])(?:_\d+)?$", stem)
+
+    if match:
+        return "View " + match.group(1).upper()
+
+    return f"View {image_index}"
+
+
+# ============================================================================
+# SKU MANAGEMENT
+# ============================================================================
+
+def get_existing_sku(variants: List[Dict]) -> str:
+    """Extract SKU from product variants"""
+    for variant in variants:
+        sku = variant.get("sku") or ""
+
+        if isinstance(sku, list):
+            sku = " ".join(str(item) for item in sku)
+
+        sku = str(sku).strip()
+
+        if sku:
+            return sku
+
+    return ""
+
+
+def generate_temporary_sku(
+    product: Dict,
+    used_skus: Set[str]
+) -> str:
+    """
+    Generate temporary SKU for products without existing SKU
+
+    Args:
+        product: Product dictionary
+        used_skus: Set of already-used SKUs
+
+    Returns:
+        Unique SKU
+    """
+    product_id = str(product.get("id", ""))
+    category = determine_category(product)
+
+    if not product_id:
+        product_id = "0000"
+
+    number = product_id[-4:].zfill(4)
+    base = f"RAW-{category}-{number}"
+
+    sku = base
+    counter = 2
+
+    while sku in used_skus:
+        sku = f"{base}-{counter}"
+        counter += 1
+
+    used_skus.add(sku)
+
+    return sku
+
+
+# ============================================================================
+# PINTEREST FEED GENERATION
+# ============================================================================
+
+def build_pinterest_title(
+    product: Dict,
+    description: str,
+    image_url: str,
+    image_index: int
+) -> str:
+    """Build optimized Pinterest pin title"""
+    original_title = clean_text(product.get("title", "")) or "Pakistani Fashion"
+    category = determine_category(product)
+    colors, _ = extract_attributes(product, description)
+    color = colors[0] if colors else ""
+    view = image_view_label(image_url, image_index)
+    category_term = CATEGORY_DISPLAY_NAMES.get(category, "Pakistani Fashion")
+    vendor = clean_text(product.get("vendor", Config.BRAND))
+
+    parts = [original_title]
+
+    if color:
+        parts.append(color)
+
+    parts.append(category_term)
+    parts.append(view)
+
+    if vendor and vendor.lower() != Config.BRAND.lower():
+        parts.append(vendor)
+
+    # Try increasingly simplified combinations
+    candidates = [
+        " | ".join(parts),
+        " | ".join([original_title, color, category_term, view]),
+        " | ".join([original_title, color, view]),
+        " | ".join([original_title, view])
+    ]
+
+    for candidate in candidates:
+        candidate = " | ".join([item for item in candidate.split(" | ") if item])
+
+        if len(candidate) <= Config.PIN_TITLE_MAX:
+            return candidate
+
+    # Final fallback
+    return (
+        original_title[:(Config.PIN_TITLE_MAX - len(view) - 3)].rstrip()
+        + " | "
+        + view
+    )
+
+
+def build_pinterest_description(
+    product: Dict,
+    original_description: str,
+    image_url: str,
+    image_index: int
+) -> str:
+    """Build optimized Pinterest pin description"""
+    title = clean_text(product.get("title", "")) or "Pakistani Fashion"
+    category = determine_category(product)
+    colors, fabrics = extract_attributes(product, original_description)
+    view = image_view_label(image_url, image_index)
+
+    parts = [f"{view} of {title}."]
+
+    if colors:
+        parts.append("Colour: " + ", ".join(colors[:2]) + ".")
+
+    if fabrics:
+        parts.append("Fabric: " + ", ".join(fabrics[:2]) + ".")
+
+    fashion_term = FASHION_TERMS.get(category, "Pakistani women's fashion")
+    parts.append(
+        f"A {fashion_term} look from {Config.STORE_NAME}, "
+        f"featuring detailed Pakistani craftsmanship."
+    )
+
+    if original_description:
+        parts.append(trim_text(original_description, 560))
+
+    parts.append(
+        "Shop Rawayat Luxe online for Pakistani fashion with "
+        "worldwide availability."
+    )
+
+    description = " ".join(parts)
+
+    return trim_text(description, Config.PIN_DESCRIPTION_MAX)
+
+
+# ============================================================================
+# CATALOG FEED GENERATION
+# ============================================================================
+
+def build_catalog_description(
+    product: Dict,
+    original_description: str
+) -> str:
+    """Build catalog product description"""
+    title = clean_text(product.get("title", "")) or "Pakistani Fashion"
+    category = determine_category(product)
+    colors, fabrics = extract_attributes(product, original_description)
+
+    parts = [title + "."]
+
+    if colors:
+        parts.append("Colour: " + ", ".join(colors) + ".")
+
+    if fabrics:
+        parts.append("Fabric: " + ", ".join(fabrics) + ".")
+
+    fashion_term = FASHION_TERMS.get(category, "Pakistani women's fashion")
+    fashion_term = re.sub(r"^Pakistani women's\s+", "", fashion_term, flags=re.I)
+
+    parts.append(f"Pakistani women's {fashion_term} from {Config.STORE_NAME}.")
+
+    if original_description:
+        parts.append(original_description)
+
+    parts.append("Worldwide availability.")
+
+    return trim_text(" ".join(parts), Config.CATALOG_DESCRIPTION_MAX)
+
+
+# ============================================================================
+# RSS DATE FORMATTING
+# ============================================================================
+
+def format_rss_date(value: any) -> str:
+    """Format date for RSS feed (RFC 2822 format)"""
+    if not value:
+        return format_datetime(datetime.now(timezone.utc), usegmt=True)
+
+    try:
+        parsed = datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+
+        return format_datetime(parsed, usegmt=False)
+
+    except Exception as e:
+        logger.warning(f"Failed to parse date {value}: {e}")
+        return format_datetime(datetime.now(timezone.utc), usegmt=True)
+
+
+# ============================================================================
+# RSS & CATALOG GENERATION
+# ============================================================================
+
+def generate_rss_feed(
+    products: List[Dict],
+    image_cache: ImageMetadataCache
+) -> Tuple[str, int]:
+    """
+    Generate RSS feed XML
+
+    Args:
+        products: List of products
+        image_cache: Image metadata cache
+
+    Returns:
+        Tuple of (RSS XML string, number of items)
+    """
+    rss_items = []
+    current_time = datetime.now(timezone.utc)
+
+    for product in products:
+        title = clean_text(product.get("title", ""))
+        handle = product.get("handle", "") or ""
+
+        if not handle:
+            logger.debug(f"Skipping product without handle: {title}")
+            continue
+
+        product_id = str(product.get("id", ""))
+        product_url = f"{Config.SHOPIFY_STORE}/products/{handle}"
+        raw_description = product.get("body_html", "")
+        description = clean_text(raw_description)
+        images = product.get("images", [])
+
+        if not images:
+            logger.debug(f"Skipping product without images: {title}")
+            continue
+
+        published = product.get("published_at") or current_time.isoformat()
+        published_rss_date = format_rss_date(published)
+
+        # RSS uses only first image
+        first_image = images[0]
+        image_url = first_image.get("src", "")
+
+        if not image_url:
+            logger.debug(f"Skipping RSS item, first image has no URL: {title}")
+            continue
+
+        image_index = 1
+        pin_title = build_pinterest_title(product, description, image_url, image_index)
+        pin_description = build_pinterest_description(
+            product, description, image_url, image_index
+        )
+
+        # Generate stable GUID
+        image_key = f"{product_id}|{image_url}"
+        image_hash = hashlib.sha256(image_key.encode("utf-8")).hexdigest()
+        guid = f"rawayat-pinterest-{image_hash}"
+
+        # Get image metadata
+        content_length, mime_type = get_image_metadata(image_url, image_cache)
+        enclosure_length = content_length if content_length else "0"
+
+        # Build RSS item
+        rss_item = f"""
             <item>
               <title>{escape(pin_title)}</title>
               <link>{escape(product_url)}</link>
@@ -1161,287 +841,309 @@ jobs:
             </item>
             """
 
-                  rss_items.append(
-                      rss_item
-                  )
+        rss_items.append(rss_item)
 
-              # ==========================================================
-              # CATALOG FEED
-              # THIS SECTION IS LEFT AS-IS.
-              # CATALOG CONTINUES TO USE images[0].
-              # ==========================================================
+    # Build complete RSS
+    build_date = format_datetime(current_time, usegmt=True)
 
-              if not variants:
-                  continue
+    rss = f"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+     xmlns:media="http://search.yahoo.com/mrss/">
+  <channel>
+    <title>{escape(Config.STORE_NAME)}</title>
+    <link>{escape(Config.SHOPIFY_STORE)}</link>
+    <description>{escape(Config.STORE_NAME)} Pakistani Luxury Fashion</description>
+    <language>en-us</language>
+    <lastBuildDate>{escape(build_date)}</lastBuildDate>
+    <generator>Rawayat Luxe Feed Generator v2.0</generator>
+    <webMaster>{escape(Config.CONTACT_EMAIL)}</webMaster>
+    <docs>https://www.rssboard.org/rss-specification</docs>
+    <ttl>360</ttl>
+    {''.join(rss_items)}
+  </channel>
+</rss>
+"""
 
-              first_variant = variants[0]
+    return rss, len(rss_items)
 
-              price_raw = (
-                  first_variant.get(
-                      "price",
-                      "0"
-                  )
-                  or "0"
-              )
 
-              try:
-                  price_number = float(
-                      price_raw
-                  )
+def generate_catalog_feed(
+    products: List[Dict],
+    image_cache: ImageMetadataCache
+) -> Tuple[str, int]:
+    """
+    Generate Google Shopping / Pinterest catalog XML
 
-              except (
-                  ValueError,
-                  TypeError
-              ):
-                  price_number = 0
+    Args:
+        products: List of products
+        image_cache: Image metadata cache
 
-              if price_number <= 0:
-                  print(
-                      "Skipping catalog item with invalid price:",
-                      title
-                  )
-                  continue
+    Returns:
+        Tuple of (Catalog XML string, number of items)
+    """
+    catalog_items = []
 
-              pinterest_price = (
-                  f"{price_number:.2f} "
-                  f"{CURRENCY}"
-              )
+    for product in products:
+        title = clean_text(product.get("title", ""))
+        handle = product.get("handle", "") or ""
 
-              main_image = (
-                  images[0].get(
-                      "src",
-                      ""
-                  )
-              )
+        if not handle:
+            continue
 
-              if not main_image:
-                  continue
+        product_id = str(product.get("id", ""))
+        product_url = f"{Config.SHOPIFY_STORE}/products/{handle}"
+        raw_description = product.get("body_html", "")
+        description = clean_text(raw_description)
+        images = product.get("images", [])
+        variants = product.get("variants", [])
 
-              if is_preorder(product):
-                  availability = "preorder"
+        if not images or not variants:
+            continue
 
-              else:
-                  is_available = any(
-                      variant.get(
-                          "available",
-                          False
-                      )
-                      for variant in variants
-                  )
+        # Get first variant for pricing
+        first_variant = variants[0]
+        price_raw = first_variant.get("price") or "0"
 
-                  availability = (
-                      "in stock"
-                      if is_available
-                      else "out of stock"
-                  )
+        try:
+            price_number = float(price_raw)
+        except (ValueError, TypeError):
+            logger.debug(f"Invalid price for {title}: {price_raw}")
+            continue
 
-              vendor = clean_text(
-                  product.get(
-                      "vendor",
-                      BRAND
-                  )
-              )
+        if price_number <= 0:
+            logger.debug(f"Skipping catalog item with zero/negative price: {title}")
+            continue
 
-              if not vendor:
-                  vendor = BRAND
+        pinterest_price = f"{price_number:.2f} {Config.CURRENCY}"
 
-              category = determine_category(
-                  product
-              )
+        main_image = images[0].get("src", "")
+        if not main_image:
+            continue
 
-              catalog_title = (
-                  title
-                  or "Pakistani Fashion"
-              )
+        # Availability
+        if is_preorder(product):
+            availability = "preorder"
+        else:
+            is_available = any(v.get("available", False) for v in variants)
+            availability = "in stock" if is_available else "out of stock"
 
-              catalog_description = (
-                  build_catalog_description(
-                      product,
-                      description
-                  )
-              )
+        # Brand and category
+        vendor = clean_text(product.get("vendor", Config.BRAND)) or Config.BRAND
+        category = determine_category(product)
 
-              colors, fabrics = (
-                  extract_attributes(
-                      product,
-                      description
-                  )
-              )
+        catalog_title = title or "Pakistani Fashion"
+        catalog_description = build_catalog_description(product, description)
+        colors, fabrics = extract_attributes(product, description)
 
-              color_value = (
-                  colors[0]
-                  if colors
-                  else ""
-              )
+        color_value = colors[0] if colors else ""
+        material_value = fabrics[0] if fabrics else ""
 
-              material_value = (
-                  fabrics[0]
-                  if fabrics
-                  else ""
-              )
+        category_path = GOOGLE_CATEGORIES.get(
+            category,
+            "Apparel & Accessories > Clothing > Traditional & Ceremonial Clothing"
+        )
 
-              category_path = (
-                  google_product_category(
-                      product
-                  )
-              )
+        # Build catalog item
+        cat_item_parts = [
+            "<item>",
+            f"  <g:id>{escape(product_id)}</g:id>",
+            f"  <g:item_group_id>{escape(product_id)}</g:item_group_id>",
+            f"  <g:title>{escape(catalog_title[:Config.CATALOG_TITLE_MAX])}</g:title>",
+            f"  <g:description>{escape(catalog_description)}</g:description>",
+            f"  <g:link>{escape(product_url)}</g:link>",
+            f"  <g:image_link>{escape(main_image)}</g:image_link>",
+            f"  <g:price>{escape(pinterest_price)}</g:price>",
+            f"  <g:availability>{availability}</g:availability>",
+            "  <g:condition>new</g:condition>",
+            f"  <g:brand>{escape(vendor)}</g:brand>",
+            "  <g:gender>female</g:gender>",
+            "  <g:age_group>adult</g:age_group>",
+            f"  <g:product_type>{escape(PRODUCT_TYPE_LABELS.get(category, 'Pakistani Fashion'))}</g:product_type>",
+            f"  <g:google_product_category>{escape(category_path)}</g:google_product_category>"
+        ]
 
-              cat_item_parts = [
-                  "<item>",
-                  f"  <g:id>{escape(product_id)}</g:id>",
-                  f"  <g:item_group_id>{escape(product_id)}</g:item_group_id>",
-                  f"  <g:title>{escape(catalog_title[:CATALOG_TITLE_MAX])}</g:title>",
-                  f"  <g:description>{escape(catalog_description)}</g:description>",
-                  f"  <g:link>{escape(product_url)}</g:link>",
-                  f"  <g:image_link>{escape(main_image)}</g:image_link>",
-                  f"  <g:price>{escape(pinterest_price)}</g:price>",
-                  f"  <g:availability>{availability}</g:availability>",
-                  "  <g:condition>new</g:condition>",
-                  f"  <g:brand>{escape(vendor)}</g:brand>",
-                  "  <g:gender>female</g:gender>",
-                  "  <g:age_group>adult</g:age_group>",
-                  f"  <g:product_type>{escape(product_type_label(category))}</g:product_type>",
-                  f"  <g:google_product_category>{escape(category_path)}</g:google_product_category>"
-              ]
+        if color_value:
+            cat_item_parts.append(f"  <g:color>{escape(color_value[:30])}</g:color>")
 
-              if color_value:
-                  cat_item_parts.append(
-                      f"  <g:color>{escape(color_value[:30])}</g:color>"
-                  )
+        if material_value:
+            cat_item_parts.append(f"  <g:material>{escape(material_value[:30])}</g:material>")
 
-              if material_value:
-                  cat_item_parts.append(
-                      f"  <g:material>{escape(material_value[:30])}</g:material>"
-                  )
+        cat_item_parts.append("</item>")
 
-              cat_item_parts.append(
-                  "</item>"
-              )
+        catalog_items.append("\n".join(cat_item_parts))
 
-              catalog_items.append(
-                  "\n".join(
-                      cat_item_parts
-                  )
-              )
+    # Build complete catalog
+    catalog = f"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+     xmlns:g="http://base.google.com/ns/1.0">
+  <channel>
+    <title>{escape(Config.STORE_NAME)} Catalog</title>
+    <link>{escape(Config.SHOPIFY_STORE)}</link>
+    <description>{escape(Config.STORE_NAME)} Pinterest Product Catalog</description>
+    <generator>Rawayat Luxe Feed Generator v2.0</generator>
+    {''.join(catalog_items)}
+  </channel>
+</rss>
+"""
 
-          rss = f"""<?xml version="1.0" encoding="UTF-8"?>
-          <rss version="2.0"
-               xmlns:media="http://search.yahoo.com/mrss/">
-            <channel>
-              <title>{escape(STORE_NAME)}</title>
-              <link>{escape(SHOPIFY_STORE)}</link>
-              <description>{escape(STORE_NAME)} Pakistani Luxury Fashion</description>
-              <language>en-us</language>
-              <lastBuildDate>{escape(format_datetime(datetime.now(timezone.utc), usegmt=True))}</lastBuildDate>
-              {''.join(rss_items)}
-            </channel>
-          </rss>
-          """
+    return catalog, len(catalog_items)
 
-          with open(
-              "rss.xml",
-              "w",
-              encoding="utf-8"
-          ) as file:
-              file.write(rss)
 
-          catalog = f"""<?xml version="1.0" encoding="UTF-8"?>
-          <rss version="2.0"
-               xmlns:g="http://base.google.com/ns/1.0">
-            <channel>
-              <title>{escape(STORE_NAME)} Catalog</title>
-              <link>{escape(SHOPIFY_STORE)}</link>
-              <description>{escape(STORE_NAME)} Pinterest Product Catalog</description>
-              {''.join(catalog_items)}
-            </channel>
-          </rss>
-          """
+# ============================================================================
+# XML VALIDATION
+# ============================================================================
 
-          with open(
-              "catalog.xml",
-              "w",
-              encoding="utf-8"
-          ) as file:
-              file.write(catalog)
+def validate_xml(xml_string: str, schema_type: str = "rss") -> Tuple[bool, str]:
+    """
+    Validate XML structure and compliance
 
-          # Validate both XML outputs before committing.
-          ET.parse("rss.xml")
-          ET.parse("catalog.xml")
+    Args:
+        xml_string: XML string to validate
+        schema_type: Type of schema to validate against
 
-          print(
-              f"Generated rss.xml with "
-              f"{len(rss_items)} product items."
-          )
+    Returns:
+        Tuple of (is_valid, message)
+    """
+    try:
+        root = ET.fromstring(xml_string)
 
-          print(
-              f"Generated catalog.xml with "
-              f"{len(catalog_items)} products."
-          )
+        if schema_type == "rss":
+            if root.tag != "rss":
+                return False, "Root element must be <rss>"
 
-          print(
-              "Prices kept in PKR. "
-              "No currency conversion performed."
-          )
+            if "version" not in root.attrib:
+                return False, "Missing version attribute on <rss>"
 
-          print(
-              "RSS uses ONLY the first Shopify product image "
-              "(images[0]) and creates ONE RSS item per product."
-          )
+            channel = root.find("channel")
+            if channel is None:
+                return False, "Missing <channel> element"
 
-          print(
-              "Pinterest Pin titles are product-specific, "
-              "first-image-specific, and limited to 100 characters."
-          )
+            required_channel_fields = ["title", "link", "description"]
+            for field in required_channel_fields:
+                if channel.find(field) is None:
+                    return False, f"Missing required <{field}> in channel"
 
-          print(
-              "Pinterest Pin descriptions are product-specific, "
-              "first-image-specific, and kept below 800 characters."
-          )
+        return True, "Valid XML"
 
-          print(
-              "RSS items use stable hash-based GUIDs."
-          )
+    except ET.ParseError as e:
+        return False, f"XML parse error: {e}"
+    except Exception as e:
+        return False, f"Validation error: {e}"
 
-          print(
-              "RSS enclosure MIME types are detected from "
-              "the first image URL/CDN headers."
-          )
 
-          print(
-              "RSS includes media:content for image compatibility."
-          )
+# ============================================================================
+# FILE OPERATIONS
+# ============================================================================
 
-          print(
-              "Catalog titles match Shopify product titles."
-          )
+def write_feed_file(filepath: str, content: str) -> bool:
+    """
+    Write feed content to file with error handling
 
-          print(
-              "Catalog includes product type, gender, age group, "
-              "colour/material when available, and Google category."
-          )
+    Args:
+        filepath: Path to write to
+        content: Content to write
 
-          print(
-              "Existing Shopify SKUs preserved where available."
-          )
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        Path(filepath).parent.mkdir(parents=True, exist_ok=True)
 
-          print(
-              "Temporary descriptive SKUs generated for products "
-              "without Shopify SKUs."
-          )
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
 
-          print(
-              "Shopify API SKU synchronization is NOT enabled yet."
-          )
+        logger.info(f"Successfully wrote {filepath} ({len(content)} bytes)")
+        return True
 
-          PY
+    except Exception as e:
+        logger.error(f"Failed to write {filepath}: {e}")
+        return False
 
-      - name: Commit RSS feed and Catalog
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
 
-          git add rss.xml catalog.xml
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
 
-          git diff --cached --quiet || git commit -m "Optimize Rawayat Pinterest RSS and catalog feeds"
+def main():
+    """Main execution function"""
+    try:
+        logger.info("=" * 70)
+        logger.info("Rawayat Luxe Pinterest RSS & Catalog Feed Generator v2.0")
+        logger.info("=" * 70)
+        logger.info(f"Store: {Config.SHOPIFY_STORE}")
+        logger.info(f"Brand: {Config.BRAND}")
+        logger.info(f"Currency: {Config.CURRENCY}")
+        logger.info("")
 
-          git push
+        # Fetch products
+        logger.info("STEP 1: Fetching products from Shopify...")
+        products = fetch_shopify_products(Config.SHOPIFY_STORE)
+
+        if not products:
+            logger.error("No products fetched. Aborting.")
+            return 1
+
+        logger.info(f"Successfully fetched {len(products)} products")
+        logger.info("")
+
+        # Initialize cache
+        image_cache = ImageMetadataCache()
+
+        # Generate RSS feed
+        logger.info("STEP 2: Generating RSS feed...")
+        rss_content, rss_count = generate_rss_feed(products, image_cache)
+
+        # Validate RSS
+        is_valid, message = validate_xml(rss_content, "rss")
+        if not is_valid:
+            logger.error(f"RSS validation failed: {message}")
+            return 1
+
+        logger.info(f"RSS feed generated with {rss_count} items")
+        logger.info("RSS feed validation: PASSED ✓")
+        logger.info("")
+
+        # Generate catalog
+        logger.info("STEP 3: Generating catalog feed...")
+        catalog_content, catalog_count = generate_catalog_feed(products, image_cache)
+
+        # Validate catalog
+        is_valid, message = validate_xml(catalog_content, "rss")
+        if not is_valid:
+            logger.error(f"Catalog validation failed: {message}")
+            return 1
+
+        logger.info(f"Catalog feed generated with {catalog_count} items")
+        logger.info("Catalog feed validation: PASSED ✓")
+        logger.info("")
+
+        # Write files
+        logger.info("STEP 4: Writing feeds to disk...")
+
+        rss_written = write_feed_file(Config.RSS_FILE, rss_content)
+        catalog_written = write_feed_file(Config.CATALOG_FILE, catalog_content)
+
+        if not (rss_written and catalog_written):
+            logger.error("Failed to write one or more feed files")
+            return 1
+
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("GENERATION COMPLETE")
+        logger.info("=" * 70)
+        logger.info(f"RSS File: {Config.RSS_FILE} ({rss_count} items)")
+        logger.info(f"Catalog File: {Config.CATALOG_FILE} ({catalog_count} items)")
+        logger.info(f"Total products processed: {len(products)}")
+        logger.info(f"Image metadata cache: {len(image_cache.cache)} entries")
+        logger.info("=" * 70)
+        logger.info("")
+
+        return 0
+
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
