@@ -1,0 +1,166 @@
+
+name: Update Shopify RSS Feed
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-feed:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Generate Pinterest RSS feed
+        env:
+          SHOPIFY_STORE: https://rawayatluxe.com
+        run: |
+          python3 - <<'PY'
+          import json
+          import re
+          import html
+          from datetime import datetime, timezone
+          from email.utils import format_datetime
+          from decimal import Decimal
+          from urllib.request import Request, urlopen
+          from urllib.parse import urlparse
+          from xml.etree.ElementTree import Element, SubElement, ElementTree, register_namespace
+
+          STORE = "https://rawayatluxe.com"
+          CURRENCY = "PKR"
+          BRAND = "Rawayat"
+          G = "http://base.google.com/ns/1.0"
+          register_namespace("g", G)
+
+          def clean(value):
+              value = html.unescape(str(value or ""))
+              value = re.sub(r"(?is)<(script|style)\b[^>]*>.*?</\1>", " ", value)
+              value = re.sub(r"(?s)<[^>]+>", " ", value)
+              return re.sub(r"\s+", " ", value).strip()
+
+          def add(parent, tag, value):
+              node = SubElement(parent, tag)
+              node.text = str(value)
+              return node
+
+          def gadd(parent, tag, value):
+              return add(parent, "{" + G + "}" + tag, value)
+
+          url = STORE + "/products.json?limit=250"
+          req = Request(url, headers={"User-Agent": "Rawayat-Pinterest-RSS/3.0"})
+
+          with urlopen(req, timeout=60) as response:
+              products = json.load(response).get("products", [])
+
+          if not products:
+              raise RuntimeError("No Shopify products returned; feed was not replaced.")
+
+          rss = Element("rss", {"version": "2.0"})
+          channel = SubElement(rss, "channel")
+          add(channel, "title", "Rawayat Luxe")
+          add(channel, "link", STORE)
+          add(channel, "description", "Pakistani luxury fashion by Rawayat Luxe")
+          add(channel, "language", "en-us")
+
+          count = 0
+
+          for p in products:
+              images = p.get("images") or []
+              if not images or not images[0].get("src"):
+                  continue
+
+              pid = str(p.get("id", ""))
+              handle = p.get("handle", "")
+              title = clean(p.get("title", ""))[:100]
+              if not pid or not handle or not title:
+                  continue
+
+              image = images[0]["src"]
+              link = STORE + "/products/" + handle
+              desc = clean(p.get("body_html", ""))[:790]
+              variants = p.get("variants") or []
+              variant = variants[0] if variants else {}
+
+              item = SubElement(channel, "item")
+              add(item, "title", title)
+              add(item, "link", link)
+              add(item, "guid", pid).set("isPermaLink", "false")
+              add(item, "description", desc)
+
+              published = p.get("published_at")
+              try:
+                  dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+                  if dt.tzinfo is None:
+                      dt = dt.replace(tzinfo=timezone.utc)
+              except (ValueError, AttributeError):
+                  dt = datetime.now(timezone.utc)
+              add(item, "pubDate", format_datetime(dt.astimezone(timezone.utc)))
+
+              mime = "image/jpeg"
+              path = urlparse(image).path.lower()
+              if path.endswith(".png"):
+                  mime = "image/png"
+              elif path.endswith(".webp"):
+                  mime = "image/webp"
+
+              SubElement(item, "enclosure", {
+                  "url": image, "type": mime, "length": "0"
+              })
+
+              gadd(item, "id", pid)
+              gadd(item, "item_group_id", pid)
+              gadd(item, "title", title)
+              gadd(item, "link", link)
+              gadd(item, "image_link", image)
+              gadd(item, "brand", BRAND)
+              gadd(item, "condition", "new")
+
+              price = variant.get("price")
+              if price not in (None, ""):
+                  try:
+                      gadd(item, "price", f"{Decimal(str(price)):.2f} {CURRENCY}")
+                  except Exception:
+                      pass
+
+              tags = p.get("tags") or ""
+              if isinstance(tags, list):
+                  tags = ",".join(tags)
+              if "preorder" in str(tags).lower():
+                  availability = "preorder"
+              elif variant.get("available") is False:
+                  availability = "out_of_stock"
+              else:
+                  availability = "in_stock"
+              gadd(item, "availability", availability)
+
+              product_type = clean(p.get("product_type", ""))
+              if product_type:
+                  gadd(item, "product_type", product_type)
+
+              count += 1
+
+          if count == 0:
+              raise RuntimeError("No products with usable images; feed was not replaced.")
+
+          ElementTree(rss).write("rss.xml", encoding="utf-8", xml_declaration=True)
+          print(f"Created RSS feed with {count} products, one first image per product.")
+          print("This workflow does not modify catalog.xml.")
+          PY
+
+      - name: Save updated RSS feed
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add rss.xml
+          if git diff --cached --quiet; then
+            echo "No RSS changes to commit."
+          else
+            git commit -m "Update Pinterest RSS feed"
+            git push
+          fi
