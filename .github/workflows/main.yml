@@ -1,3 +1,4 @@
+
 name: Update Shopify RSS Feed and Catalog
 
 on:
@@ -8,38 +9,50 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: rawayat-shopify-pinterest-feeds
+  cancel-in-progress: false
+
 jobs:
   update-feeds:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Generate RSS and Pinterest catalog XML
+      - name: Generate and validate RSS and catalog feeds
         env:
           SHOPIFY_STORE: https://rawayatluxe.com
         run: |
           python3 - <<'PY'
           import html
           import json
+          import os
           import re
+          import tempfile
+          import time
           from datetime import datetime, timezone
           from decimal import Decimal, InvalidOperation
           from email.utils import format_datetime
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlencode, urlparse, quote
           from urllib.request import Request, urlopen
-          from urllib.parse import urlparse
-          from xml.etree.ElementTree import Element, SubElement, ElementTree, register_namespace
+          from xml.etree.ElementTree import Element, SubElement, ElementTree, register_namespace, fromstring, tostring
 
-          STORE = "https://rawayatluxe.com"
+          STORE = os.environ.get("SHOPIFY_STORE", "https://rawayatluxe.com").rstrip("/")
           CURRENCY = "PKR"
           BRAND = "Rawayat"
-          G_NS = "http://base.google.com/ns/1.0"
-          register_namespace("g", G_NS)
+          GOOGLE_NS = "http://base.google.com/ns/1.0"
+          MAX_PAGE_SIZE = 250
+          MAX_PAGES = 100
+          register_namespace("g", GOOGLE_NS)
 
-          def clean(value):
-              value = str(value or "")
-              value = re.sub(r"(?is)<(script|style)\b[^>]*>.*?</\1>", " ", value)
+          def clean_text(value):
+              """Convert Shopify HTML or values to safe, whitespace-normalized plain text."""
+              value = html.unescape(str(value or ""))
+              value = re.sub(r"(?is)<(script|style)\b[^>]*>.*?</\1\s*>", " ", value)
               value = re.sub(r"(?s)<[^>]+>", " ", value)
               value = html.unescape(value)
               return re.sub(r"\s+", " ", value).strip()
@@ -49,162 +62,421 @@ jobs:
               node.text = str(value)
               return node
 
-          def add_g(parent, tag, value):
-              return add(parent, "{" + G_NS + "}" + tag, value)
+          def gadd(parent, field, value):
+              return add(parent, "{" + GOOGLE_NS + "}" + field, value)
 
-          def get_products():
-              products = []
-              seen_ids = set()
-              for page in range(1, 101):
-                  url = f"{STORE}/products.json?limit=250&page={page}"
+          def request_json(url, attempts=4):
+              last_error = None
+              for attempt in range(attempts):
                   request = Request(url, headers={
-                      "User-Agent": "Rawayat-Pinterest-Feed/4.0",
+                      "User-Agent": "Rawayat-Pinterest-Feeds/4.0 (+https://rawayatluxe.com)",
                       "Accept": "application/json"
                   })
-                  with urlopen(request, timeout=60) as response:
-                      batch = json.load(response).get("products", [])
+                  try:
+                      with urlopen(request, timeout=60) as response:
+                          payload = json.load(response)
+                      if not isinstance(payload, dict) or not isinstance(payload.get("products"), list):
+                          raise RuntimeError("Shopify returned an unexpected products JSON structure.")
+                      return payload
+                  except HTTPError as exc:
+                      last_error = exc
+                      if exc.code not in (408, 425, 429, 500, 502, 503, 504) or attempt == attempts - 1:
+                          raise
+                  except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+                      last_error = exc
+                      if attempt == attempts - 1:
+                          raise
+                  time.sleep(2 ** attempt)
+              raise RuntimeError(f"Shopify request failed: {last_error}")
+
+          def fetch_all_products():
+              products = []
+              seen_ids = set()
+              for page in range(1, MAX_PAGES + 1):
+                  query = urlencode({"limit": MAX_PAGE_SIZE, "page": page})
+                  payload = request_json(f"{STORE}/products.json?{query}")
+                  batch = payload["products"]
                   if not batch:
                       break
-                  added = 0
-                  for product in batch:
-                      pid = str(product.get("id", "")).strip()
-                      if pid and pid not in seen_ids:
-                          seen_ids.add(pid)
-                          products.append(product)
-                          added += 1
-                  if added == 0 or len(batch) < 250:
+                  page_ids = [str(p.get("id", "")).strip() for p in batch]
+                  if any(not pid for pid in page_ids):
+                      raise RuntimeError("Shopify returned a product without an ID; refusing to publish an incomplete feed.")
+                  if len(set(page_ids)) != len(page_ids):
+                      raise RuntimeError("Shopify returned duplicate IDs within one page; refusing to publish duplicate feed items.")
+                  overlap = seen_ids.intersection(page_ids)
+                  if overlap:
+                      raise RuntimeError(
+                          "Shopify pagination returned duplicate product IDs. Feeds were not overwritten "
+                          "to avoid publishing an incomplete catalog."
+                      )
+                  products.extend(batch)
+                  seen_ids.update(page_ids)
+                  print(f"Fetched page {page}: {len(batch)} products (total {len(products)}).")
+                  if len(batch) < MAX_PAGE_SIZE:
                       break
+              else:
+                  raise RuntimeError(f"Reached safety limit of {MAX_PAGES} Shopify pages; refusing a potentially partial feed.")
               if not products:
-                  raise RuntimeError("Shopify returned zero products; feeds were not replaced.")
+                  raise RuntimeError("Shopify returned zero products; existing feed files will be preserved.")
               return products
 
-          def product_data(product):
+          def product_primary_image(product):
+              main = product.get("image")
+              if isinstance(main, dict) and main.get("src"):
+                  return str(main["src"]).strip(), clean_text(main.get("alt"))
               images = product.get("images") or []
-              if not images or not images[0].get("src"):
-                  return None
+              images = sorted(images, key=lambda img: (img.get("position") is None, img.get("position") or 999999))
+              for image in images:
+                  if isinstance(image, dict) and image.get("src"):
+                      return str(image["src"]).strip(), clean_text(image.get("alt"))
+              return "", ""
 
-              pid = str(product.get("id", "")).strip()
-              handle = str(product.get("handle", "")).strip()
-              title = clean(product.get("title", ""))[:500]
-              description = clean(product.get("body_html", ""))[:10000]
-              if not pid or not handle or not title or not description:
-                  return None
+          def product_url(handle):
+              return f"{STORE}/products/{quote(str(handle), safe='-._~')}"
 
-              variants = product.get("variants") or []
-              available_variants = [v for v in variants if v.get("available", True)]
-              variant = (available_variants or variants or [{}])[0]
+          def parse_date(value):
               try:
-                  price = Decimal(str(variant.get("price", ""))).quantize(Decimal("0.01"))
-              except (InvalidOperation, ValueError):
-                  return None
-              if price <= 0:
+                  parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                  if parsed.tzinfo is None:
+                      parsed = parsed.replace(tzinfo=timezone.utc)
+                  return parsed.astimezone(timezone.utc)
+              except (ValueError, TypeError):
+                  return datetime.now(timezone.utc)
+
+          def money(value):
+              try:
+                  amount = Decimal(str(value)).quantize(Decimal("0.01"))
+                  if not amount.is_finite() or amount <= 0:
+                      return None
+                  return amount
+              except (InvalidOperation, TypeError, ValueError):
                   return None
 
-              tags = product.get("tags") or ""
-              if isinstance(tags, list):
-                  tags = ",".join(str(t) for t in tags)
-              if "preorder" in str(tags).lower():
+          def option_values(product, variant):
+              names = []
+              values = []
+              for index, option in enumerate(product.get("options") or [], start=1):
+                  name = clean_text(option.get("name", ""))
+                  value = clean_text(variant.get(f"option{index}", ""))
+                  if name and value and value.lower() not in ("default title", "default"):
+                      names.append(name[:30])
+                      values.append(value[:30])
+              return names, values
+
+          def variant_is_available(variant):
+              if isinstance(variant.get("available"), bool):
+                  return variant["available"]
+              quantity = variant.get("inventory_quantity")
+              if isinstance(quantity, (int, float)):
+                  return quantity > 0 or variant.get("inventory_policy") == "continue"
+              return variant.get("inventory_policy") == "continue"
+
+          def is_preorder(product):
+              raw_tags = product.get("tags") or ""
+              if isinstance(raw_tags, list):
+                  tags = raw_tags
+              else:
+                  tags = str(raw_tags).split(",")
+              normalized = {re.sub(r"[^a-z]", "", str(tag).lower()) for tag in tags}
+              return bool(normalized.intersection({"preorder", "preorderitem", "presale"}))
+
+          def choose_variant(product):
+              variants = [v for v in (product.get("variants") or []) if isinstance(v, dict)]
+              priced = [(money(v.get("price")), v) for v in variants]
+              priced = [(price, v) for price, v in priced if price is not None]
+              if not priced:
+                  return None, None
+              available = [(price, v) for price, v in priced if variant_is_available(v)]
+              candidates = available or priced
+              # Lowest-priced available variant yields an accurate current price;
+              # link the catalog item directly to that variant where Shopify exposes its ID.
+              candidates.sort(key=lambda pair: (pair[0], str(pair[1].get("id", ""))))
+              return candidates[0][1], candidates[0][0]
+
+          def product_category(product):
+              haystack = " ".join([
+                  clean_text(product.get("title", "")),
+                  clean_text(product.get("product_type", "")),
+                  clean_text(product.get("tags", ""))
+              ]).lower()
+              if "saree" in haystack or "sari" in haystack:
+                  return "Clothing > Women > Sarees"
+              if "unstitched" in haystack or "fabric" in haystack:
+                  return "Clothing > Women > Unstitched Suits and Fabric"
+              if "bridal" in haystack or "wedding" in haystack or "lehenga" in haystack:
+                  return "Clothing > Women > Bridal and Wedding Wear"
+              if "casual" in haystack or "lawn" in haystack:
+                  return "Clothing > Women > Casual Clothing"
+              return "Clothing > Women > Formal and Traditional Wear"
+
+          def product_color(product, variant, names, values):
+              for name, value in zip(names, values):
+                  if name.lower() in ("color", "colour"):
+                      return value[:30]
+              # Only emit a body-derived color when all explicit "Color:" mentions agree.
+              body = clean_text(product.get("body_html", ""))
+              matches = re.findall(
+                  r"\bcolou?r\s*:\s*([A-Za-z][A-Za-z /&-]{0,25}?)(?=\s+(?:fabric|shirt|trouser|pants|dupatta|work details|model|note)\b|[.;]|$)",
+                  body,
+                  flags=re.IGNORECASE
+              )
+              colors = {re.sub(r"\s+", " ", match).strip(" -/") for match in matches if match.strip()}
+              if len(colors) == 1:
+                  return next(iter(colors))[:30]
+              return ""
+
+          def product_material(product):
+              # Only provide material when the public title/type/tags/description identify
+              # exactly one recognized material; avoid guessing when mixed fabrics are listed.
+              source = " ".join([
+                  clean_text(product.get("title", "")),
+                  clean_text(product.get("product_type", "")),
+                  clean_text(product.get("tags", "")),
+                  clean_text(product.get("body_html", ""))
+              ]).lower()
+              terms = [
+                  "zari tissue", "tissue silk", "raw silk", "cotton satin", "charmeuse",
+                  "georgette", "khaddar", "organza", "chiffon", "velvet", "jacquard",
+                  "palachi", "lawn", "linen", "net", "silk", "cotton", "cambric"
+              ]
+              material_pattern = re.compile(r"\b(" + "|".join(re.escape(term) for term in terms) + r")\b")
+              found = list(dict.fromkeys(material_pattern.findall(source)))
+              if len(found) == 1:
+                  return found[0][:30]
+              return ""
+
+          def tag_list(product):
+              tags = product.get("tags") or []
+              if isinstance(tags, str):
+                  tags = tags.split(",")
+              return [clean_text(tag) for tag in tags if clean_text(tag)]
+
+          products = fetch_all_products()
+          now = datetime.now(timezone.utc)
+
+          # RSS 2.0: one item per Shopify product and exactly one image-bearing
+          # element (one enclosure). Do not emit extra image links/media-content tags.
+          rss = Element("rss", {"version": "2.0"})
+          channel = SubElement(rss, "channel")
+          add(channel, "title", "Rawayat Luxe")
+          add(channel, "link", STORE)
+          add(channel, "description", "Pakistani luxury fashion by Rawayat Luxe")
+          add(channel, "language", "en-us")
+          add(channel, "lastBuildDate", format_datetime(now, usegmt=True))
+
+          rss_count = 0
+          catalog_count = 0
+          skipped_catalog = 0
+          skipped_rss = 0
+          catalog = Element("rss", {"version": "2.0"})
+          catalog_channel = SubElement(catalog, "channel")
+          add(catalog_channel, "title", "Rawayat Luxe Product Catalog")
+          add(catalog_channel, "link", STORE)
+          add(catalog_channel, "description", "Rawayat Luxe product catalog feed")
+          add(catalog_channel, "language", "en-us")
+          add(catalog_channel, "lastBuildDate", format_datetime(now, usegmt=True))
+
+          used_catalog_ids = set()
+          for product in products:
+              product_id = str(product.get("id", "")).strip()
+              handle = str(product.get("handle", "")).strip()
+              title = clean_text(product.get("title", ""))
+              image_url, image_alt = product_primary_image(product)
+              if not product_id or not handle or not title or not image_url.startswith(("https://", "http://")):
+                  skipped_rss += 1
+                  skipped_catalog += 1
+                  continue
+
+              description = clean_text(product.get("body_html", ""))
+              if not description:
+                  description = f"{title} by {BRAND}. View product details at Rawayat Luxe."
+              rss_description = description[:790]
+              landing_url = product_url(handle)
+
+              # RSS: primary image only. Pinterest can create Pins from each image it
+              # discovers in a feed item, so do not add additional_image_link or media tags.
+              rss_item = SubElement(channel, "item")
+              add(rss_item, "title", title[:100])
+              add(rss_item, "link", landing_url)
+              add(rss_item, "guid", product_id).set("isPermaLink", "false")
+              add(rss_item, "description", rss_description)
+              add(rss_item, "pubDate", format_datetime(parse_date(product.get("published_at")), usegmt=True))
+              extension = urlparse(image_url).path.lower()
+              mime = "image/png" if extension.endswith(".png") else "image/webp" if extension.endswith(".webp") else "image/gif" if extension.endswith(".gif") else "image/jpeg"
+              SubElement(rss_item, "enclosure", {"url": image_url, "type": mime, "length": "0"})
+              rss_count += 1
+
+              # Catalog: one row/product to preserve the numeric Shopify product ID
+              # used by the existing Pinterest Tag/CAPI content_ids. We intentionally
+              # omit additional_image_link so catalog ingestion cannot create extra
+              # image Pins from gallery images.
+              variant, selected_price = choose_variant(product)
+              if variant is None or selected_price is None or selected_price <= 0:
+                  skipped_catalog += 1
+                  print(f"WARNING: catalog skipped product {product_id} ({title!r}): no valid positive price.")
+                  continue
+              if product_id in used_catalog_ids:
+                  raise RuntimeError(f"Duplicate catalog product ID {product_id}; refusing to publish duplicate IDs.")
+              used_catalog_ids.add(product_id)
+
+              variant_id = str(variant.get("id", "")).strip()
+              link = landing_url + (f"?variant={quote(variant_id, safe='')}" if variant_id.isdigit() else "")
+              names, values = option_values(product, variant)
+              display_title = title
+              if values:
+                  variant_details = ", ".join(f"{name}: {value}" for name, value in zip(names, values))
+                  display_title = (title + " — " + variant_details)[:500]
+              catalog_description = description[:10000]
+              if not catalog_description:
+                  catalog_description = f"{title} by {BRAND}."
+
+              # Correct price/sale_price semantics when Shopify provides compare_at_price.
+              compare_price = money(variant.get("compare_at_price"))
+              regular_price = selected_price
+              sale_price = None
+              if compare_price is not None and compare_price > selected_price:
+                  regular_price = compare_price
+                  sale_price = selected_price
+
+              tags = tag_list(product)
+              preorder = is_preorder(product)
+              variants = [v for v in (product.get("variants") or []) if isinstance(v, dict)]
+              if preorder:
                   availability = "preorder"
-              elif available_variants:
+              elif any(variant_is_available(v) for v in variants):
                   availability = "in stock"
               else:
                   availability = "out of stock"
 
-              image = str(images[0].get("src", "")).strip()
-              link = f"{STORE}/products/{handle}"
-              product_type = clean(product.get("product_type", ""))
-              pub_date = product.get("published_at")
-              try:
-                  dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
-                  if dt.tzinfo is None:
-                      dt = dt.replace(tzinfo=timezone.utc)
-              except (ValueError, AttributeError):
-                  dt = datetime.now(timezone.utc)
+              item = SubElement(catalog_channel, "item")
+              gadd(item, "id", product_id)  # Keep aligned to product-level Pinterest CAPI content_ids.
+              gadd(item, "item_group_id", product_id)  # Product-level grouping; not individual variant rows.
+              gadd(item, "title", display_title)
+              gadd(item, "description", catalog_description)
+              gadd(item, "link", link)
+              gadd(item, "image_link", image_url)
+              gadd(item, "price", f"{regular_price:.2f} {CURRENCY}")
+              if sale_price is not None:
+                  gadd(item, "sale_price", f"{sale_price:.2f} {CURRENCY}")
+              gadd(item, "availability", availability)
+              gadd(item, "brand", BRAND)
+              gadd(item, "condition", "new")
+              gadd(item, "adult", "false")
+              gadd(item, "gender", "female")
+              gadd(item, "age_group", "adult")
+              gadd(item, "google_product_category", "Apparel & Accessories > Clothing")
+              gadd(item, "product_type", product_category(product))
+              gadd(item, "alt_text", (image_alt or title)[:500])
 
-              return {
-                  "id": pid,
-                  "title": title,
-                  "description": description,
-                  "rss_description": description[:790],
-                  "link": link,
-                  "image": image,
-                  "price": f"{price:.2f} {CURRENCY}",
-                  "availability": availability,
-                  "product_type": product_type,
-                  "pub_date": format_datetime(dt.astimezone(timezone.utc)),
-              }
+              color = product_color(product, variant, names, values)
+              if color:
+                  gadd(item, "color", color)
+              size_value = ""
+              for name, value in zip(names, values):
+                  if name.lower() in ("size", "sizes"):
+                      size_value = value
+                      break
+              if size_value:
+                  gadd(item, "size", size_value[:30])
+              material = product_material(product)
+              if material:
+                  gadd(item, "material", material)
 
-          def make_root(title, description):
-              root = Element("rss", {"version": "2.0"})
-              channel = SubElement(root, "channel")
-              add(channel, "title", title)
-              add(channel, "link", STORE)
-              add(channel, "description", description)
-              add(channel, "language", "en-us")
-              return root, channel
+              # The title/link/price describe one representative variant; we do not
+              # create duplicate rows for every size/color because Pinterest CAPI uses
+              # this store's product-level numeric ID as its content_id.
+              sku = clean_text(variant.get("sku", ""))
+              if sku and len(sku) <= 70 and re.fullmatch(r"[A-Za-z0-9]+", sku):
+                  gadd(item, "mpn", sku)
 
-          def add_common_google_fields(item, p, full_description=False):
-              add_g(item, "id", p["id"])
-              # Keep the product/group ID aligned with the Shopify product ID.
-              add_g(item, "item_group_id", p["id"])
-              add_g(item, "title", p["title"])
-              add_g(item, "link", p["link"])
-              add_g(item, "image_link", p["image"])
-              add_g(item, "brand", BRAND)
-              add_g(item, "condition", "new")
-              add_g(item, "price", p["price"])
-              add_g(item, "availability", p["availability"])
-              if p["product_type"]:
-                  add_g(item, "product_type", p["product_type"])
-              add_g(item, "description", p["description"] if full_description else p["rss_description"])
+              gadd(item, "custom_label_0", product_category(product).split(" > ")[-1][:100])
+              catalog_count += 1
 
-          products = get_products()
-          rss_root, rss_channel = make_root(
-              "Rawayat Luxe", "Pakistani luxury fashion by Rawayat Luxe"
-          )
-          catalog_root, catalog_channel = make_root(
-              "Rawayat Luxe Product Catalog", "Product catalog for Rawayat Luxe"
-          )
+          if rss_count == 0:
+              raise RuntimeError("No valid RSS products found; existing feed files were preserved.")
+          if catalog_count == 0:
+              raise RuntimeError("No catalog products with valid prices found; existing feed files were preserved.")
 
-          count = 0
-          skipped = 0
-          for product in products:
-              p = product_data(product)
-              if p is None:
-                  skipped += 1
-                  continue
+          # Serialize and parse back before touching the published feed files.
+          rss_bytes = b"<?xml version='1.0' encoding='utf-8'?>\n" + tostring(rss, encoding="utf-8")
+          catalog_bytes = b"<?xml version='1.0' encoding='utf-8'?>\n" + tostring(catalog, encoding="utf-8")
+          for label, content in (("rss.xml", rss_bytes), ("catalog.xml", catalog_bytes)):
+              parsed = fromstring(content)
+              if parsed.tag != "rss" or parsed.get("version") != "2.0":
+                  raise RuntimeError(f"XML validation failed for {label}.")
+              if not parsed.findall("./channel/item"):
+                  raise RuntimeError(f"Validation failed for {label}: no items.")
 
-              # RSS: one entry and one primary image per product.
-              rss_item = SubElement(rss_channel, "item")
-              add(rss_item, "title", p["title"][:100])
-              add(rss_item, "link", p["link"])
-              add(rss_item, "guid", p["id"]).set("isPermaLink", "false")
-              add(rss_item, "description", p["rss_description"])
-              add(rss_item, "pubDate", p["pub_date"])
-              mime = "image/jpeg"
-              image_path = urlparse(p["image"]).path.lower()
-              if image_path.endswith(".png"):
-                  mime = "image/png"
-              elif image_path.endswith(".webp"):
-                  mime = "image/webp"
-              SubElement(rss_item, "enclosure", {
-                  "url": p["image"], "type": mime, "length": "0"
-              })
-              add_common_google_fields(rss_item, p, full_description=False)
+          # Confirm exactly one image enclosure for each RSS item and no extra images
+          # in the catalog file (g:image_link is its sole image field per item).
+          rss_check = fromstring(rss_bytes)
+          rss_items = rss_check.findall("./channel/item")
+          rss_ids = [item.findtext("guid", default="").strip() for item in rss_items]
+          if len(rss_ids) != len(set(rss_ids)):
+              raise RuntimeError("RSS validation failed: duplicate product IDs.")
+          for item in rss_items:
+              if len(item.findall("enclosure")) != 1:
+                  raise RuntimeError("RSS validation failed: each item must contain exactly one enclosure.")
+              if item.find("image") is not None:
+                  raise RuntimeError("RSS validation failed: unexpected second image field in an item.")
+              enclosure_url = item.find("enclosure").get("url", "")
+              if not enclosure_url.startswith(("https://", "http://")):
+                  raise RuntimeError("RSS validation failed: enclosure has an invalid image URL.")
+          catalog_check = fromstring(catalog_bytes)
+          catalog_ids = set()
+          allowed_availability = {"in stock", "out of stock", "preorder"}
+          for item in catalog_check.findall("./channel/item"):
+              required = ["id", "title", "description", "link", "image_link", "price", "availability"]
+              values_by_field = {}
+              for field in required:
+                  node = item.find("{" + GOOGLE_NS + "}" + field)
+                  if node is None or not (node.text or "").strip():
+                      raise RuntimeError(f"Catalog validation failed: missing {field} on an item.")
+                  values_by_field[field] = node.text.strip()
+              product_id = values_by_field["id"]
+              if product_id in catalog_ids:
+                  raise RuntimeError(f"Catalog validation failed: duplicate product ID {product_id}.")
+              catalog_ids.add(product_id)
+              if len(product_id) > 127:
+                  raise RuntimeError("Catalog validation failed: product ID exceeds 127 characters.")
+              if len(values_by_field["title"]) > 500:
+                  raise RuntimeError("Catalog validation failed: title exceeds 500 characters.")
+              if len(values_by_field["description"]) > 10000:
+                  raise RuntimeError("Catalog validation failed: description exceeds 10,000 characters.")
+              if len(values_by_field["link"]) > 511:
+                  raise RuntimeError("Catalog validation failed: product link exceeds 511 characters.")
+              if len(values_by_field["image_link"]) > 2000:
+                  raise RuntimeError("Catalog validation failed: image link exceeds 2,000 characters.")
+              if not values_by_field["link"].startswith(("https://", "http://")) or not values_by_field["image_link"].startswith(("https://", "http://")):
+                  raise RuntimeError("Catalog validation failed: product or image URL is not HTTP(S).")
+              if values_by_field["availability"] not in allowed_availability:
+                  raise RuntimeError("Catalog validation failed: unsupported availability value.")
+              price_parts = values_by_field["price"].split()
+              if len(price_parts) != 2 or price_parts[1] != CURRENCY or money(price_parts[0]) is None:
+                  raise RuntimeError("Catalog validation failed: price must be a positive amount followed by ISO currency PKR.")
+              if item.find("{" + GOOGLE_NS + "}additional_image_link") is not None:
+                  raise RuntimeError("Catalog validation failed: additional images are not allowed in this single-image setup.")
 
-              # Catalog: include every required Pinterest retail-catalog field.
-              catalog_item = SubElement(catalog_channel, "item")
-              add_common_google_fields(catalog_item, p, full_description=True)
-              count += 1
+          # Stage both complete files and replace existing versions only after validation.
+          staged = []
+          try:
+              for filename, content in (("rss.xml", rss_bytes), ("catalog.xml", catalog_bytes)):
+                  fd, temp_path = tempfile.mkstemp(prefix=filename + ".", suffix=".tmp", dir=".")
+                  with os.fdopen(fd, "wb") as output:
+                      output.write(content)
+                  staged.append((temp_path, filename))
+              for temp_path, filename in staged:
+                  os.replace(temp_path, filename)
+          finally:
+              for temp_path, _ in staged:
+                  if os.path.exists(temp_path):
+                      os.remove(temp_path)
 
-          if count == 0:
-              raise RuntimeError("No valid products found; feeds were not replaced.")
-
-          ElementTree(rss_root).write("rss.xml", encoding="utf-8", xml_declaration=True)
-          ElementTree(catalog_root).write("catalog.xml", encoding="utf-8", xml_declaration=True)
-          print(f"Generated rss.xml and catalog.xml for {count} products.")
-          print(f"Skipped {skipped} products with missing images, descriptions, IDs, or valid prices.")
-          print("Only the first product image is used; no additional image fields are included.")
+          print(f"SUCCESS: rss.xml contains {rss_count} products; each has exactly one primary image.")
+          print(f"SUCCESS: catalog.xml contains {catalog_count} products and all required Pinterest catalog fields.")
+          print(f"Skipped RSS products without ID/title/handle/primary image: {skipped_rss}.")
+          print(f"Skipped catalog products without valid positive prices: {skipped_catalog}.")
+          print("No additional_image_link fields were generated in either feed.")
           PY
 
       - name: Commit updated feeds
@@ -213,7 +485,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add rss.xml catalog.xml
           if git diff --cached --quiet; then
-            echo "No feed changes to commit."
+            echo "Feed files are already up to date."
           else
             git commit -m "Update Pinterest RSS and catalog feeds"
             git push
